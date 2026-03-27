@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ClearLine</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="background"></div>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Payment Reconciliation</p>
+          <h1>ClearLine</h1>
+          <p class="lede">
+            Unified daily settlement review across Shift4, FreedomPay, and Amazon
+            JWO.
+          </p>
+        </div>
+        <div class="hero-card">
+          <p class="label">Prototype scope</p>
+          <p class="value">Engine first. Browser ready. No vendor lock-in.</p>
+        </div>
+      </section>
+
+      <section id="metrics" class="metrics"></section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Processor Summary</h2>
+          </div>
+          <div id="processor-summary"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Discrepancy Mix</h2>
+          </div>
+          <div id="discrepancy-summary"></div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Action Queue</h2>
+          <span id="generated-at" class="muted"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Processor</th>
+                <th>Ref</th>
+                <th>Terminal</th>
+                <th>Type</th>
+                <th>Amount</th>
+                <th>Flag</th>
+                <th>Suggested Action</th>
+              </tr>
+            </thead>
+            <tbody id="action-queue"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+  </html>
+
