@@ -1,7 +1,6 @@
 [![GitHub stars](https://img.shields.io/github/stars/nxd914/latency?style=social)](https://github.com/nxd914/latency/stargazers)
 [![License](https://img.shields.io/github/license/nxd914/latency)](https://github.com/nxd914/latency/blob/main/LICENSE)
-[![Node version](https://img.shields.io/node/v/nxd914/latency)](https://nodejs.org)
-[![GitHub last commit](https://img.shields.io/github/last-commit/nxd914/latency)](https://github.com/nxd914/latency/commits/main)
+[![Top Language](https://img.shields.io/github/languages/top/nxd914/latency)](https://github.com/nxd914/latency)[![GitHub last commit](https://img.shields.io/github/last-commit/nxd914/latency)](https://github.com/nxd914/latency/commits/main)
 [![GitHub issues](https://img.shields.io/github/issues/nxd914/latency)](https://github.com/nxd914/latency/issues)
 
 # Kalshi Crypto Latency Arbitrage
