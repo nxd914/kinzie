@@ -17,6 +17,8 @@ import os
 import signal
 from pathlib import Path
 
+from latency.core.logging import configure_logging
+
 
 def _load_project_dotenv() -> None:
     """Load `.env` from repo root so the daemon sees API keys without manual export."""
@@ -44,10 +46,7 @@ from latency.agents import (  # noqa: E402
 )
 from latency.core.models import Signal, Tick, TradeOpportunity  # noqa: E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 BANKROLL_USDC = float(os.environ.get("BANKROLL_USDC", "100000.0"))
