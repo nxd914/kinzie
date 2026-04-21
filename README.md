@@ -5,18 +5,47 @@
 
 # Kinzie
 
-Proprietary trading research. Internal use only.
+Async prediction market trading system built in Python 3.11+. Deterministic execution pipeline — no ML, no heuristics. Every decision is a closed-form function of market price and realized volatility, sized by Kelly criterion, gated behind hard risk controls.
+
+## Architecture
+
+```
+CryptoFeedAgent ──► FeatureAgent ──► ScannerAgent ──► RiskAgent ──► ExecutionAgent ──► ResolutionAgent
+                                          ▲
+                                    WebsocketAgent
+                                   (real-time price cache)
+```
+
+Seven concurrent async agents coordinated through typed `asyncio.Queue` instances and a read-only WebSocket price cache. No shared mutable state between agents.
+
+## Stack
+
+- **Runtime**: Python 3.11+, `asyncio`, frozen dataclasses throughout
+- **Persistence**: SQLite audit trail — every fill records market state at signal time
+- **Testing**: pytest + [Hypothesis](https://hypothesis.readthedocs.io/) property-based tests; AAA pattern; 80%+ coverage enforced in CI
+- **Quality**: ruff (lint + format), mypy (strict), GitHub Actions on every push and PR across Python 3.11/3.12
+- **Deployment**: Docker + Railway; structured JSON logging via `LOG_FORMAT=json`
 
 ## Repository
 
 ```
-core/       Pricing and risk models
-agents/     Execution pipeline
-tests/      Test suite
-research/   Analysis and monitoring tools
-docs/       Internal documentation
-deploy/     Infrastructure
+core/       Pricing and risk models — pure math, no I/O, no side effects
+agents/     Async execution layer — seven concurrent agents
+tests/      Pytest suite + Hypothesis property tests
+research/   Replay backtester, health checks, P&L analysis
+benchmarks/ Hot-path profiling
+docs/       Strategy derivations, risk model, ops runbook
+deploy/     Docker / Railway config
 ```
+
+## Quick start
+
+```bash
+pip install -e ".[dev]"
+pytest tests/
+```
+
+Requires credentials set in a `.env` at the repo root (see `CLAUDE.md`). Paper mode is the default — live trading is gated behind empirical performance thresholds enforced in `core/config.py`.
 
 ## License
 
