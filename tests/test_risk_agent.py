@@ -12,9 +12,9 @@ import asyncio
 import pytest
 from datetime import datetime, timedelta, timezone
 
-from latency.agents.risk_agent import RiskAgent
-from latency.core.config import DEFAULT_CONFIG
-from latency.core.models import (
+from strategies.crypto.agents.risk_agent import RiskAgent
+from strategies.crypto.core.config import DEFAULT_CONFIG
+from strategies.crypto.core.models import (
     FeatureVector,
     KalshiMarket,
     Side,
@@ -214,6 +214,82 @@ async def test_cooldown_allows_after_interval():
 
 
 # ---------------------------------------------------------------------------
+# Breakeven gate
+# ---------------------------------------------------------------------------
+
+def _make_opp_at_price(ticker: str, price: float, edge: float) -> TradeOpportunity:
+    """Build an opportunity where yes_ask == price and opp.edge == edge."""
+    spread = DEFAULT_CONFIG.min_spread_pct + 0.01
+    half = spread / 2
+    market = KalshiMarket(
+        ticker=ticker,
+        title="Breakeven test",
+        event_ticker="",
+        yes_bid=price - half,
+        yes_ask=price,
+        no_bid=price - half,
+        no_ask=price,
+        implied_prob=price - half,
+        spread_pct=spread,
+        volume_24h=5000,
+        liquidity=2000,
+        close_time="",
+        timestamp=datetime.now(tz=timezone.utc),
+    )
+    fv = FeatureVector("SYM", datetime.now(tz=timezone.utc), 0.0, 0.0, 0.0, False, 0.0)
+    sig = Signal(SignalType.MOMENTUM_UP, "SYM", datetime.now(tz=timezone.utc), fv, 0.1, 0.9, ())
+    return TradeOpportunity(
+        signal=sig,
+        market=market,
+        side=Side.YES,
+        model_prob=price + edge,
+        market_prob=price,
+        edge=edge,
+        kelly_fraction=0.1,
+        capped_fraction=0.1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_breakeven_gate_rejects_sub_breakeven_edge():
+    """Edge below fee+slippage at ATM must be rejected."""
+    from strategies.crypto.core.config import Config
+    cfg = Config(estimated_slippage=0.005)
+    agent = RiskAgent(asyncio.Queue(), asyncio.Queue(), bankroll_usdc=500.0, config=cfg)
+    # At P=0.5: fee = 0.07*0.5*0.5 = 0.0175; breakeven = 0.0175 + 0.005 = 0.0225
+    # edge=0.015 < 0.0225 → reject
+    opp = _make_opp_at_price("BELOW", price=0.50, edge=0.015)
+    assert agent._evaluate(opp) is None
+
+
+@pytest.mark.asyncio
+async def test_breakeven_gate_approves_sufficient_edge():
+    """Edge clearly above fee+slippage must pass the breakeven gate."""
+    from strategies.crypto.core.config import Config
+    cfg = Config(estimated_slippage=0.005)
+    agent = RiskAgent(asyncio.Queue(), asyncio.Queue(), bankroll_usdc=500.0, config=cfg)
+    # At P=0.5: breakeven = 0.0225; edge=0.10 passes
+    opp = _make_opp_at_price("ABOVE", price=0.50, edge=0.10)
+    assert agent._evaluate(opp) is not None
+
+
+@pytest.mark.asyncio
+async def test_breakeven_gate_lower_at_extreme_price():
+    """Fee is smaller at extreme prices (P=0.1), so breakeven is lower than at ATM.
+
+    edge=0.02 is below the ATM breakeven (0.0225) but above the P=0.1 breakeven
+    (0.0113), demonstrating the gate is price-aware and not a static floor.
+    """
+    from strategies.crypto.core.config import Config
+    cfg = Config(estimated_slippage=0.005)
+    agent = RiskAgent(asyncio.Queue(), asyncio.Queue(), bankroll_usdc=500.0, config=cfg)
+    # At P=0.1: fee = 0.07*0.1*0.9 = 0.0063; breakeven = 0.0063+0.005 = 0.0113
+    # edge=0.02 > 0.0113 → passes breakeven; also clears MIN_KELLY at this price
+    opp = _make_opp_at_price("EXTREME", price=0.10, edge=0.02)
+    assert agent._evaluate(opp) is not None
+
+
+# ---------------------------------------------------------------------------
 # Per-symbol concentration limit
 # ---------------------------------------------------------------------------
 
@@ -396,3 +472,43 @@ async def test_no_price_within_band_passes():
     mid_price = (DEFAULT_CONFIG.min_no_fill_price + DEFAULT_CONFIG.max_no_fill_price) / 2
     opp = _make_no_opp("KXBTC-OK", no_ask=mid_price)
     assert agent._evaluate(opp) is not None
+
+
+# ---------------------------------------------------------------------------
+# Per-expiry concentration limit
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_expiry_concentration_rejects_second_same_expiry():
+    """Second position with the same expiry key must be rejected (default limit=1)."""
+    agent = _make_agent()
+    # Two tickers with same expiry segment "26MAY0213" but different brackets
+    opp1 = _make_opp("KXETH-26MAY0213-B2300")
+    opp2 = _make_opp("KXETH-26MAY0213-B2320")
+    assert agent._evaluate(opp1) is not None
+    # Cooldown would also block opp2, so advance fill time to isolate the expiry gate
+    agent._last_fill_time = None
+    assert agent._evaluate(opp2) is None
+
+
+@pytest.mark.asyncio
+async def test_expiry_concentration_allows_different_expiry():
+    """Positions at different expiry hours should both be approved."""
+    agent = _make_agent()
+    opp1 = _make_opp("KXETH-26MAY0213-B2300")
+    opp2 = _make_opp("KXETH-26MAY0214-B2300")
+    assert agent._evaluate(opp1) is not None
+    agent._last_fill_time = None
+    assert agent._evaluate(opp2) is not None
+
+
+@pytest.mark.asyncio
+async def test_expiry_concentration_slot_freed_after_resolve():
+    """After a position resolves, the expiry slot opens for a new bracket bet."""
+    agent = _make_agent()
+    opp1 = _make_opp("KXETH-26MAY0213-B2300")
+    assert agent._evaluate(opp1) is not None
+    agent.record_fill("KXETH-26MAY0213-B2300", 10.0)
+    agent._last_fill_time = None
+    opp2 = _make_opp("KXETH-26MAY0213-B2320")
+    assert agent._evaluate(opp2) is not None
