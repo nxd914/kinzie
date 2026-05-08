@@ -26,7 +26,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from core.kalshi_client import KalshiClient
-from core.kelly import MIN_EDGE, capped_kelly
+from core.kelly import capped_kelly
+from ..core.config import Config, DEFAULT_CONFIG
 from ..core.models import (
     FeatureVector,
     KalshiMarket,
@@ -103,24 +104,28 @@ class ScannerAgent:
         price_cache: Optional[dict] = None,
         crypto_features: Optional[dict] = None,
         scan_limit: int = SCAN_LIMIT,
-        min_edge: float = MIN_EDGE,
+        min_edge: float = 0.02,
+        enable_brackets: bool = True,
+        config: Optional[Config] = None,
     ) -> None:
         self._opportunities = opportunity_queue
         self._bankroll = bankroll_usdc
         self._signals = signal_queue
-        self._scan_limit = scan_limit
-        self._min_edge = min_edge
+        self._cfg = config or DEFAULT_CONFIG
+        # Derive gate thresholds from Config (single source of truth).
+        self._scan_limit = self._cfg.scan_limit
+        self._min_edge = self._cfg.min_edge
+        self._enable_brackets = self._cfg.enable_brackets
         self._price_cache = price_cache or {}
         self._crypto_features = crypto_features or {}
         self._client = KalshiClient()
         self._scan_lock: Optional[asyncio.Lock] = None
         self._market_cache: list[KalshiMarket] = []
         self._market_cache_ts: float = 0.0
-        # Last-known spot/vol per symbol, updated from every signal that passes through.
-        # Gives the periodic scan a reliable fallback when _crypto_features has a stale
-        # or zero-price entry (e.g. a bad tick from Binance.US/Coinbase slipped through).
-        self._spot_cache: dict[str, tuple[float, float]] = {}  # symbol -> (spot, vol)
+        self._spot_cache: dict[str, tuple[float, float]] = {}
         self._last_scan_ts: Optional[datetime] = None
+        # Per-cycle skip-reason counter for histogram logging.
+        self._skip_counts: dict[str, int] = {}
 
     def set_bankroll(self, usdc: float) -> None:
         """Update bankroll from live account balance. Used by daemon's refresher."""
@@ -153,13 +158,13 @@ class ScannerAgent:
         """Return cached market list, refreshing if stale or forced."""
         now = asyncio.get_event_loop().time()
         age = now - self._market_cache_ts
-        if force_refresh or not self._market_cache or age >= SCAN_INTERVAL_SECONDS:
+        if force_refresh or not self._market_cache or age >= self._cfg.scan_interval_seconds:
             async with self._scan_lock:  # type: ignore[union-attr]
                 # Re-check inside lock to avoid double-fetch
                 now = asyncio.get_event_loop().time()
-                if force_refresh or not self._market_cache or (now - self._market_cache_ts) >= SCAN_INTERVAL_SECONDS:
+                if force_refresh or not self._market_cache or (now - self._market_cache_ts) >= self._cfg.scan_interval_seconds:
                     markets = await self._client.get_top_markets(
-                        limit=max(self._scan_limit, SIGNAL_SCAN_CANDIDATE_LIMIT),
+                        limit=max(self._scan_limit, self._cfg.signal_scan_candidate_limit),
                         min_volume_24h=0.0,
                         min_liquidity=0.0,
                     )
@@ -192,12 +197,12 @@ class ScannerAgent:
 
     async def _periodic_scan(self) -> None:
         """Fetch crypto markets and price them against live spot data."""
-        logger.info("Scanner: waiting %ds for feeds to warm up...", SCAN_STARTUP_DELAY_SECONDS)
-        await asyncio.sleep(SCAN_STARTUP_DELAY_SECONDS)
+        logger.info("Scanner: waiting %ds for feeds to warm up...", self._cfg.scan_startup_delay_seconds)
+        await asyncio.sleep(self._cfg.scan_startup_delay_seconds)
         while True:
             if not _is_trading_hours():
-                logger.info("Scanner: outside trading hours, sleeping %ds", IDLE_SCAN_INTERVAL_SECONDS)
-                await asyncio.sleep(IDLE_SCAN_INTERVAL_SECONDS)
+                logger.info("Scanner: outside trading hours, sleeping %ds", self._cfg.idle_scan_interval_seconds)
+                await asyncio.sleep(self._cfg.idle_scan_interval_seconds)
                 continue
             try:
                 self._last_scan_ts = datetime.now(tz=timezone.utc)
@@ -210,7 +215,7 @@ class ScannerAgent:
                 await self._evaluate_batch(crypto_markets, signal=None)
             except Exception as exc:
                 logger.warning("Scanner periodic scan error: %s", exc)
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+            await asyncio.sleep(self._cfg.scan_interval_seconds)
 
     async def _signal_scan(self) -> None:
         """When a crypto signal fires, re-evaluate matching contracts from cache.
@@ -247,7 +252,7 @@ class ScannerAgent:
 
             # Enforce cooldown
             now = asyncio.get_event_loop().time()
-            wait = SIGNAL_COOLDOWN_SECONDS - (now - _last_scan)
+            wait = self._cfg.signal_cooldown_seconds - (now - _last_scan)
             if wait > 0:
                 await asyncio.sleep(wait)
             _last_scan = asyncio.get_event_loop().time()
@@ -282,7 +287,8 @@ class ScannerAgent:
         signal: Optional[Signal],
     ) -> None:
         """Evaluate a list of markets concurrently."""
-        sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+        self._skip_counts.clear()
+        sem = asyncio.Semaphore(self._cfg.scan_concurrency)
 
         async def evaluate(market: KalshiMarket) -> None:
             async with sem:
@@ -291,6 +297,24 @@ class ScannerAgent:
                     await self._opportunities.put(opp)
 
         await asyncio.gather(*[evaluate(m) for m in markets], return_exceptions=True)
+        self._log_skip_summary(len(markets), is_signal=signal is not None)
+
+    def _skip(self, reason: str) -> None:
+        """Record a skip reason and return None (for use in _score)."""
+        self._skip_counts[reason] = self._skip_counts.get(reason, 0) + 1
+        return None
+
+    def _log_skip_summary(self, total: int, *, is_signal: bool) -> None:
+        """Log the per-cycle skip histogram for diagnostics."""
+        if not self._skip_counts:
+            return
+        parts = [f"{k}={v}" for k, v in sorted(self._skip_counts.items(), key=lambda x: -x[1])]
+        passed = total - sum(self._skip_counts.values())
+        label = "SIGNAL_SCAN" if is_signal else "SCAN_CYCLE"
+        logger.info(
+            "%s skips (total=%d passed=%d): %s",
+            label, total, max(0, passed), " | ".join(parts),
+        )
 
     def _score(
         self,
@@ -313,13 +337,13 @@ class ScannerAgent:
 
         hours_to_close = _hours_until(market.close_time)
         # 15M markets have a much shorter max horizon than bracket/threshold
-        max_hours = 0.5 if is_up_down else MAX_HOURS_TO_CLOSE
+        max_hours = self._cfg.horizon_15m_hours if is_up_down else self._cfg.max_hours_to_close
         if hours_to_close > max_hours:
             logger.debug(
                 "SCORE skip too_far_out: %s | hours=%.2f > %.1f",
                 market.ticker, hours_to_close, max_hours,
             )
-            return None
+            return self._skip("too_far_out")
 
         # Apply real-time Kalshi WS price override (immutable update)
         market = self._apply_price_cache(market)
@@ -328,23 +352,41 @@ class ScannerAgent:
         spot_price, realized_vol = self._get_spot_data(market, signal)
         if spot_price <= 0:
             logger.info("SCORE skip no_spot: %s | symbol=%s", market.ticker, _market_symbol(market))
-            return None
+            return self._skip("no_spot")
 
         # Reuse hours_to_close computed above
         hours_to_expiry = hours_to_close
         if hours_to_expiry <= 0:
-            return None
+            return self._skip("expired")
 
         # Skip if vol data isn't warmed up yet (prevents trading with fake vol)
         if realized_vol <= 0.0:
             logger.info("SCORE skip vol_warmup: %s", market.ticker)
-            return None
-        vol = max(realized_vol, MIN_CRYPTO_VOL)
+            return self._skip("vol_warmup")
+        vol = max(realized_vol, self._cfg.min_crypto_vol)
 
+        # ------------------------------------------------------------------
+        # Resolve drift from features (short for ≤15min, long for ≥1h)
+        # ------------------------------------------------------------------
+        drift = 0.0
+        features = None
+        symbol = _market_symbol(market)
+        if signal is not None and signal.features is not None:
+            features = signal.features
+        elif symbol and symbol in self._crypto_features:
+            features = self._crypto_features[symbol]
+
+        if features is not None:
+            drift = features.ewma_drift_short if is_up_down else features.ewma_drift_long
+
+        # ------------------------------------------------------------------
+        # Compute model_prob WITH drift (p_drift) and WITHOUT drift (p_zero)
+        # ------------------------------------------------------------------
         if is_up_down:
             # 15-min directional: YES = price higher at expiry than current spot.
-            # Model is ~0.50 without drift; edge comes from Kalshi market drifting from 50%.
-            model_prob = up_down_15m_prob(spot_price, hours_to_expiry, vol)
+            p_drift = up_down_15m_prob(spot_price, hours_to_expiry, vol, drift=drift)
+            p_zero  = up_down_15m_prob(spot_price, hours_to_expiry, vol, drift=0.0)
+            model_prob = p_drift
             strike_repr = f"atm@{spot_price:.0f}"
         elif is_bracket:
             # Bracket: YES resolves if floor < spot < cap at expiry
@@ -357,14 +399,16 @@ class ScannerAgent:
             # ATM proximity guard — model is unreliable when spot is near bracket range
             bracket_mid = (floor + cap) / 2.0
             distance_pct = abs(spot_price - bracket_mid) / spot_price if spot_price > 0 else 0.0
-            if distance_pct < MIN_BRACKET_DISTANCE_PCT:
+            if distance_pct < self._cfg.min_bracket_distance_pct:
                 logger.info(
                     "SCORE skip atm_bracket: %s | spot=%.0f mid=%.0f dist=%.4f < %.4f",
-                    market.ticker, spot_price, bracket_mid, distance_pct, MIN_BRACKET_DISTANCE_PCT,
+                    market.ticker, spot_price, bracket_mid, distance_pct, self._cfg.min_bracket_distance_pct,
                 )
-                return None
+                return self._skip("atm_bracket")
 
-            model_prob = bracket_prob(spot_price, floor, cap, hours_to_expiry, vol)
+            p_drift = bracket_prob(spot_price, floor, cap, hours_to_expiry, vol, drift=drift)
+            p_zero  = bracket_prob(spot_price, floor, cap, hours_to_expiry, vol, drift=0.0)
+            model_prob = p_drift
             strike_repr = f"[{floor:.0f},{cap:.0f}]"
         else:
             # Threshold: YES resolves if spot > strike (or < strike for "less")
@@ -372,44 +416,110 @@ class ScannerAgent:
             if strike is None:
                 logger.info("SCORE skip no_strike: %s | title=%s", market.ticker, market.title[:60])
                 return None
-            prob_above = spot_to_implied_prob(spot_price, strike, hours_to_expiry, vol)
-            model_prob = (1.0 - prob_above) if _is_less_market(market) else prob_above
+            prob_above_drift = spot_to_implied_prob(spot_price, strike, hours_to_expiry, vol, drift=drift)
+            prob_above_zero  = spot_to_implied_prob(spot_price, strike, hours_to_expiry, vol, drift=0.0)
+            if _is_less_market(market):
+                p_drift = 1.0 - prob_above_drift
+                p_zero  = 1.0 - prob_above_zero
+            else:
+                p_drift = prob_above_drift
+                p_zero  = prob_above_zero
+            model_prob = p_drift
             strike_repr = f"{strike:.0f}"
 
+        # ------------------------------------------------------------------
+        # Disagreement gate: on signal-driven scans, drift must materially
+        # move the model AND the direction must match the chosen side.
+        # Periodic scans (signal=None) find structural mispricing via
+        # model_prob vs market_price and don't require momentum confirmation.
+        # ------------------------------------------------------------------
+        disagreement = p_drift - p_zero  # positive = drift made YES more likely
+        if signal is not None and abs(disagreement) < self._cfg.min_disagreement:
+            logger.info(
+                "SCORE skip low_disagreement: %s | p_drift=%.4f p_zero=%.4f |diff|=%.5f < %.4f",
+                market.ticker, p_drift, p_zero, abs(disagreement), self._cfg.min_disagreement,
+            )
+            return self._skip("low_disagreement")
+
         # Block bracket YES bets above price cap (inverted risk/reward)
-        if is_bracket and model_prob > market.implied_prob and market.yes_ask > MAX_BRACKET_YES_PRICE:
+        if is_bracket and model_prob > market.implied_prob and market.yes_ask > self._cfg.max_bracket_yes_price:
             logger.info(
                 "SCORE skip bracket_yes_too_expensive: %s | yes_ask=%.2f > %.2f",
-                market.ticker, market.yes_ask, MAX_BRACKET_YES_PRICE,
+                market.ticker, market.yes_ask, self._cfg.max_bracket_yes_price,
             )
-            return None
+            return self._skip("bracket_yes_too_expensive")
 
-        # Compute edge
-        edge = abs(model_prob - market.implied_prob)
+        # Block bracket NO bets above price cap (pennies in front of steamroller)
+        if is_bracket and model_prob < market.implied_prob and market.no_ask > self._cfg.max_bracket_no_price:
+            logger.info(
+                "SCORE skip bracket_no_too_expensive: %s | no_ask=%.2f > %.2f",
+                market.ticker, market.no_ask, self._cfg.max_bracket_no_price,
+            )
+            return self._skip("bracket_no_too_expensive")
+
+        # Universal YES price cap — don't buy YES above max_yes_fill_price
+        if model_prob > market.implied_prob and market.yes_ask > self._cfg.max_yes_fill_price:
+            logger.info(
+                "SCORE skip yes_too_expensive: %s | yes_ask=%.2f > %.2f",
+                market.ticker, market.yes_ask, self._cfg.max_yes_fill_price,
+            )
+            return self._skip("yes_too_expensive")
+
+        # Universal NO price cap — don't buy NO above max_no_fill_price
+        if model_prob < market.implied_prob and market.no_ask > self._cfg.max_no_fill_price:
+            logger.info(
+                "SCORE skip no_too_expensive: %s | no_ask=%.2f > %.2f",
+                market.ticker, market.no_ask, self._cfg.max_no_fill_price,
+            )
+            return self._skip("no_too_expensive")
+
+        # Drift sign must match chosen side (signal scans only):
+        # YES side → disagreement > 0 (drift made it more likely)
+        # NO side  → disagreement < 0 (drift made it less likely)
+        # Periodic scans use model_prob (with drift=0) so disagreement is ~0;
+        # sign check would be noise.
+        side = Side.YES if model_prob > market.implied_prob else Side.NO
+        if signal is not None and side == Side.YES and disagreement < 0:
+            logger.info(
+                "SCORE skip drift_sign_mismatch: %s | side=YES but drift opposes (disagree=%.4f)",
+                market.ticker, disagreement,
+            )
+            return self._skip("drift_sign_mismatch")
+        if signal is not None and side == Side.NO and disagreement > 0:
+            logger.info(
+                "SCORE skip drift_sign_mismatch: %s | side=NO but drift opposes (disagree=%.4f)",
+                market.ticker, disagreement,
+            )
+            return self._skip("drift_sign_mismatch")
+
+        # Compute edge against the ask (actual cost to enter), not the mid.
+        market_price = market.yes_ask if side == Side.YES else market.no_ask
+        if side == Side.YES:
+            edge = model_prob - market_price
+        else:
+            edge = (1.0 - model_prob) - market_price
+        edge = max(0.0, edge)
         if edge < self._min_edge:
             logger.info(
-                "SCORE skip low_edge: %s | model=%.3f market=%.3f edge=%.3f < %.2f | spot=%.0f strike=%s",
-                market.ticker, model_prob, market.implied_prob, edge, self._min_edge,
+                "SCORE skip low_edge: %s | model=%.3f ask=%.3f edge=%.3f < %.2f | spot=%.0f strike=%s",
+                market.ticker, model_prob, market_price, edge, self._min_edge,
                 spot_price, strike_repr,
             )
-            return None
+            return self._skip("low_edge")
 
         if (
             os.environ.get("EXECUTION_MODE", "paper").lower() == "live"
-            and market.liquidity < MIN_LIVE_LIQUIDITY_USD
+            and market.liquidity < self._cfg.min_live_liquidity_usd
         ):
             logger.info(
                 "SCORE skip thin_book: %s | liquidity=%.0f < %.0f (live mode)",
-                market.ticker, market.liquidity, MIN_LIVE_LIQUIDITY_USD,
+                market.ticker, market.liquidity, self._cfg.min_live_liquidity_usd,
             )
-            return None
-
-        side = Side.YES if model_prob > market.implied_prob else Side.NO
-        market_price = market.yes_ask if side == Side.YES else market.no_ask
+            return self._skip("thin_book")
 
         kelly_f = capped_kelly(model_prob, market_price)
         if kelly_f <= 0:
-            return None
+            return self._skip("kelly_zero")
 
         effective_signal = signal or _synthetic_signal(market, model_prob, spot_price)
 

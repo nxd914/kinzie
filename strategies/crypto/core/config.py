@@ -23,11 +23,10 @@ class Config:
     # Full Kelly requires perfect probability estimates; 0.25× is standard for
     # research-grade systems where edge is unverified at scale.
 
-    min_edge: float = 0.035
-    # 3.5% minimum edge before considering a trade.
-    # Kalshi taker fee peaks at 1.75% (P=0.5). With bid-ask spread,
-    # effective cost is ~3-4% on liquid markets. Floor ensures positive EV.
-    # Lowered from 0.04 after paper confirms 14.73 Sharpe; unblocks final live-gate fills.
+    min_edge: float = 0.02
+    # Lowered 0.035→0.02 (2026-05-07). Edge is now computed against the ask
+    # (actual cost) instead of the mid. Old mid-based calc overstated edge
+    # by half the spread; at 0.035 virtually nothing passed.
 
     min_kelly: float = 0.01
     # Minimum Kelly fraction. Below 1% of bankroll, transaction costs dominate.
@@ -81,9 +80,28 @@ class Config:
     # NO-side fill floor. At NO=0.39, you risk $0.39 to win $0.61 (1.56:1).
     # Below 0.40 the risk/reward deteriorates relative to YES-side alternatives.
 
-    max_no_fill_price: float = 0.95
-    # NO-side fill cap. At NO=0.95, you risk $0.95 to win $0.05 (19:1 against).
-    # Requires 95%+ win rate to break even after fees. Catastrophic if wrong.
+    max_no_fill_price: float = 0.70
+    # NO-side fill cap. Lowered 0.95→0.70 (2026-05-07). At 0.70 you risk
+    # $0.70 to win $0.30 (2.3:1 against). Requires ~70% win rate after fees.
+    # At 0.95 (old), one loss wiped 19 wins. Portfolio showed -$334 in losses
+    # from 95-99¢ NO fills.
+
+    max_yes_fill_price: float = 0.40
+    # YES-side fill cap. Only take YES bets at 40¢ or below — risk $0.40
+    # to win $0.60 (1.5:1 for). Favorable risk/reward.
+
+    min_return_on_risk: float = 0.10
+    # Edge / market_price must exceed 10%. A 3.5pp edge on a 99¢ NO is 3.5%
+    # RoR — erased by ~1pp model error. Same edge on 50¢ = 7% RoR. Closes
+    # the asymmetry that produced the 99¢ bracket-NO fills.
+
+    ticker_reject_cooldown_seconds: int = 120
+    # After Kalshi rejects a ticker, don't re-attempt for 2 minutes.
+    # Prevents hammering one mispriced strike repeatedly.
+
+    max_15m_contracts: int = 20
+    # Position size cap for 15M Up/Down markets (number of contracts).
+    # 179 contracts on a single 15M target lost $116. Cap at 20.
 
     # ── Consecutive-loss circuit breaker ────────────────────────────────────
     consecutive_loss_pause_fills: int = 3
@@ -102,46 +120,62 @@ class Config:
     scan_concurrency: int = 8
     # Semaphore cap for parallel market evaluation.
 
-    scan_limit: int = 50
-    # Max markets to evaluate per periodic scan cycle.
+    scan_limit: int = 200
+    # Max markets per periodic scan. Reconciled 50→200 to match scanner's
+    # module constant; the old 50 was stale.
 
-    signal_candidate_limit: int = 120
-    # Wider market fetch for signal-triggered scans (more candidates to match).
+    signal_candidate_limit: int = 400
+    # Wider market fetch for signal-triggered scans.
+    # Reconciled 120→400 to match scanner's SIGNAL_SCAN_CANDIDATE_LIMIT.
+
+    signal_scan_candidate_limit: int = 400
+    # Alias for scanner call site (mirrors scanner module constant name).
 
     min_time_to_close_minutes: int = 5
-    # Skip markets with less than 5 minutes to settlement. Too little time for
-    # meaningful convergence and order processing.
+    # Skip markets with less than 5 minutes to settlement.
 
-    max_hours_to_close: int = 4
-    # Skip markets closing more than 4 hours out. Far-dated contracts can stay
-    # mispriced indefinitely — latency arb requires near-expiry convergence pressure.
+    max_hours_to_close: int = 8
+    # Skip markets closing more than 8 hours out. Bumped 4→6→8 (2026-05-07).
+    # 4-8h contracts are where drift has the most predictive power.
+    # Was 49% of all skips at the old 4h threshold.
 
-    signal_cooldown_seconds: int = 5
-    # Rate limit on signal-triggered scan loop. Prevents CPU saturation from
-    # high-frequency momentum events on volatile days.
+    signal_cooldown_seconds: int = 2
+    # Rate limit on signal-triggered scan. Reconciled 5→2 to match scanner.
 
     min_crypto_vol: float = 0.30
-    # Vol floor for BTC/ETH. In low-vol regimes, the BS model becomes unreliable.
-    # 30% annualized ≈ 0.016% per minute, consistent with historical BTC/ETH.
+    # Vol floor for BTC/ETH. 30% annualized ≈ 0.016% per minute.
 
     max_bracket_yes_price: float = 0.30
-    # Don't buy YES on bracket contracts above 30¢. At 30¢+, you're paying 30%+
-    # for a narrow range bet — risk/reward inverts relative to outright YES bets.
+    # Don't buy YES on bracket contracts above 30¢.
 
-    min_bracket_distance_pct: float = 0.005
-    # Skip brackets where spot is within 0.5% of the bracket midpoint.
-    # ATM brackets have non-linear sensitivity that the log-normal model mishandles.
+    max_bracket_no_price: float = 0.70
+    # Don't buy NO on bracket contracts above 70¢. At 85¢ you risk $0.85
+    # to win $0.15 — suicidal with any model error. Lowered from 0.85.
+
+    max_bracket_near_spot_pct: float = 0.015
+    # YES brackets only allowed within 1.5% of spot.
+
+    min_bracket_distance_pct: float = 0.003
+    # Skip brackets where spot is within 0.3% of the bracket midpoint.
+
+    enable_brackets: bool = True
+    # Enable bracket contract scanning.
+
+    horizon_15m_hours: float = 0.5
+    # Below this we use short-half-life drift; above, long-half-life.
+
+    min_live_liquidity_usd: float = 2500.0
+    # Skip markets too thin to absorb our orders (live mode only).
+
+    min_disagreement: float = 0.005
+    # Minimum |model_prob - p_zero| (drift vs no-drift). 0.5pp.
 
     trading_start_hour_utc: int = 0
     trading_end_hour_utc: int = 24
-    # Active trading window (UTC). Crypto markets trade 24/7 and Kalshi
-    # publishes 15-minute Up/Down + hourly bracket contracts continuously,
-    # so we scan around the clock. (Held over from a multi-strategy era when
-    # the bot was idle outside US equity hours.)
+    # Crypto is 24/7.
 
     idle_scan_interval_seconds: int = 600
-    # Scan cadence outside trading hours (10 min). Keeps the market cache warm
-    # without burning unnecessary API quota overnight.
+    # 10 min between scans outside trading hours.
 
     # ── Feature computation ─────────────────────────────────────────────────
     short_return_window_seconds: float = 5.0
@@ -160,6 +194,17 @@ class Config:
 
     jump_return_threshold: float = 0.002
     # 0.2% return in short window triggers jump detection.
+
+    # ── Drift / EWMA ────────────────────────────────────────────────────────
+    ewma_short_half_life_s: float = 15.0
+    # 15s half-life for ≤15min horizons. Lowered 30→15s to catch fast moves.
+
+    ewma_long_half_life_s: float = 300.0
+    # 5min half-life for ≥1h contracts.
+
+    max_drift_annualized: float = 5.0
+    # Cap |drift| at ±500%/yr. Raised 2.0→5.0 — crypto regularly exceeds
+    # 200%/yr during momentum moves; old cap truncated the signal.
 
     # ── Pricing ─────────────────────────────────────────────────────────────
     bracket_calibration: float = 0.55
@@ -256,8 +301,34 @@ class Config:
             max_signal_age_seconds=_float("MAX_SIGNAL_AGE_SECONDS", base.max_signal_age_seconds),
             min_no_fill_price=_float("MIN_NO_FILL_PRICE", base.min_no_fill_price),
             max_no_fill_price=_float("MAX_NO_FILL_PRICE", base.max_no_fill_price),
+            max_yes_fill_price=_float("MAX_YES_FILL_PRICE", base.max_yes_fill_price),
+            min_return_on_risk=_float("MIN_RETURN_ON_RISK", base.min_return_on_risk),
+            ticker_reject_cooldown_seconds=_int("TICKER_REJECT_COOLDOWN_SECONDS", base.ticker_reject_cooldown_seconds),
+            max_15m_contracts=_int("MAX_15M_CONTRACTS", base.max_15m_contracts),
             consecutive_loss_pause_fills=_int("CONSECUTIVE_LOSS_PAUSE_FILLS", base.consecutive_loss_pause_fills),
             scan_interval_seconds=_int("SCAN_INTERVAL_SECONDS", base.scan_interval_seconds),
+            scan_startup_delay_seconds=_int("SCAN_STARTUP_DELAY_SECONDS", base.scan_startup_delay_seconds),
+            scan_concurrency=_int("SCAN_CONCURRENCY", base.scan_concurrency),
+            scan_limit=_int("SCAN_LIMIT", base.scan_limit),
+            signal_candidate_limit=_int("SIGNAL_CANDIDATE_LIMIT", base.signal_candidate_limit),
+            signal_scan_candidate_limit=_int("SIGNAL_SCAN_CANDIDATE_LIMIT", base.signal_scan_candidate_limit),
+            min_time_to_close_minutes=_int("MIN_TIME_TO_CLOSE_MINUTES", base.min_time_to_close_minutes),
+            max_hours_to_close=_int("MAX_HOURS_TO_CLOSE", base.max_hours_to_close),
+            signal_cooldown_seconds=_int("SIGNAL_COOLDOWN_SECONDS", base.signal_cooldown_seconds),
+            min_crypto_vol=_float("MIN_CRYPTO_VOL", base.min_crypto_vol),
+            max_bracket_yes_price=_float("MAX_BRACKET_YES_PRICE", base.max_bracket_yes_price),
+            max_bracket_no_price=_float("MAX_BRACKET_NO_PRICE", base.max_bracket_no_price),
+            max_bracket_near_spot_pct=_float("MAX_BRACKET_NEAR_SPOT_PCT", base.max_bracket_near_spot_pct),
+            min_bracket_distance_pct=_float("MIN_BRACKET_DISTANCE_PCT", base.min_bracket_distance_pct),
+            enable_brackets=base.enable_brackets,
+            horizon_15m_hours=_float("HORIZON_15M_HOURS", base.horizon_15m_hours),
+            min_live_liquidity_usd=_float("MIN_LIVE_LIQUIDITY_USD", base.min_live_liquidity_usd),
+            min_disagreement=_float("MIN_DISAGREEMENT", base.min_disagreement),
+            idle_scan_interval_seconds=_int("IDLE_SCAN_INTERVAL_SECONDS", base.idle_scan_interval_seconds),
+            ewma_short_half_life_s=_float("EWMA_SHORT_HALF_LIFE_S", base.ewma_short_half_life_s),
+            ewma_long_half_life_s=_float("EWMA_LONG_HALF_LIFE_S", base.ewma_long_half_life_s),
+            max_drift_annualized=_float("MAX_DRIFT_ANNUALIZED", base.max_drift_annualized),
+            bracket_calibration=_float("BRACKET_CALIBRATION", base.bracket_calibration),
             assumed_fills_per_day=_int("ASSUMED_FILLS_PER_DAY", base.assumed_fills_per_day),
             min_fills_for_live=_int("MIN_FILLS_FOR_LIVE", base.min_fills_for_live),
             min_sharpe_for_live=_float("MIN_SHARPE_FOR_LIVE", base.min_sharpe_for_live),
@@ -287,6 +358,11 @@ class Config:
         assert 0 < self.max_single_exposure_pct <= 1.0, "Exposure pct must be in (0, 1]"
         assert self.max_concurrent_positions >= 1
         assert self.min_no_fill_price < self.max_no_fill_price
+        assert 0 < self.max_no_fill_price <= 0.85, "NO fill cap too high — suicidal risk/reward"
+        assert 0 < self.max_yes_fill_price <= 0.50, "YES fill cap too high"
+        assert self.min_return_on_risk > 0
+        assert self.max_hours_to_close >= 1
+        assert self.max_15m_contracts >= 1
         assert self.min_fills_for_live >= 1
         assert self.min_sharpe_for_live > 0
 

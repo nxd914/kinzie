@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/agents/execution_agent.py
+# hypothesis_version: 6.141.1
+
+[0.0, 0.01, 0.1, 0.5, 0.99, 1.0, 100.0, 1000.0, 200, 1000, 'DB write error: %s', 'REJECTED', '_error', '_order_group_id', 'avg_yes_price', 'canceled', 'cancelled', 'data', 'edge', 'environment', 'expired', 'fill_count', 'filled_count', 'id', 'kelly_fraction', 'order', 'order_id', 'paper_trades.db', 'rate_limited', 'realized_vol', 'rejected', 'signal_latency_ms', 'spot_price_at_signal', 'status', 'timestamp', 'yes_price']

@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/core/__init__.py
+# hypothesis_version: 6.141.1
+
+['capped_kelly', 'compute_kelly', 'position_size']

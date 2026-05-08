@@ -61,6 +61,9 @@ class RiskAgent:
         self._recent_outcomes: deque[bool] = deque(maxlen=config.consecutive_loss_pause_fills + 2)
         self._streak_halted: bool = False
         self._streak_halt_until: Optional[datetime] = None
+        # Per-ticker reject cooldown: avoid hammering one mispriced strike.
+        # ticker -> datetime when the cooldown expires
+        self._ticker_reject_until: dict[str, datetime] = {}
 
     async def run(self) -> None:
         while True:
@@ -76,6 +79,11 @@ class RiskAgent:
         if not self._seeded:
             self._seeded = True
             logger.info("RiskAgent: seed complete — approvals enabled")
+
+    def open_position_tickers(self) -> list[str]:
+        """Snapshot of currently-booked position slots. Used by PortfolioAgent
+        to detect orphaned slots (booked but invisible to Kalshi)."""
+        return list(self._open_positions.keys())
 
     def restore_position(self, ticker: str, size: float) -> None:
         """Re-register an open position from persistent storage after a process restart."""
@@ -114,6 +122,13 @@ class RiskAgent:
                 del self._positions_by_symbol[symbol]
         expiry = _expiry_key(ticker)
         self._positions_by_expiry.get(expiry, set()).discard(ticker)
+        # Blacklist this ticker briefly so we don't re-attempt the same
+        # mispriced strike on the next scan cycle.
+        cooldown = self._cfg.ticker_reject_cooldown_seconds
+        if cooldown > 0:
+            self._ticker_reject_until[ticker] = (
+                datetime.now(tz=timezone.utc) + timedelta(seconds=cooldown)
+            )
 
     def record_fill(self, ticker: str, pnl: float) -> None:
         """Call when a position resolves. Updates daily P&L and removes from open set."""
@@ -197,6 +212,21 @@ class RiskAgent:
             logger.debug("Already have position in %s", opp.market.ticker)
             return None
 
+        # Per-ticker reject cooldown — if Kalshi just rejected this exact
+        # ticker, don't re-attempt for ticker_reject_cooldown_seconds. Stops
+        # the daemon from hammering one mispriced strike repeatedly.
+        reject_until = self._ticker_reject_until.get(opp.market.ticker)
+        if reject_until is not None:
+            now_check = datetime.now(tz=timezone.utc)
+            if now_check < reject_until:
+                logger.info(
+                    "RISK REJECT ticker_cooldown: %s | %.0fs left",
+                    opp.market.ticker, (reject_until - now_check).total_seconds(),
+                )
+                return None
+            else:
+                self._ticker_reject_until.pop(opp.market.ticker, None)
+
         # Burst protection — don't fill all slots from a single signal burst
         now = datetime.now(tz=timezone.utc)
         if self._last_fill_time is not None:
@@ -244,13 +274,19 @@ class RiskAgent:
         # Fee is parabolic: peaks at P=0.5. Tick/slippage rounding costs dominate at
         # extreme prices. Static min_edge doesn't account for price-dependent dynamics.
         fee_cost = self._cfg.kalshi_taker_fee_rate * market_price * (1.0 - market_price)
-        breakeven = fee_cost + self._cfg.estimated_slippage
+        # Dynamic slippage: half the market spread is the expected cost of crossing.
+        # Floor at estimated_slippage to avoid zero-spread edge cases.
+        dynamic_slippage = max(
+            self._cfg.estimated_slippage,
+            opp.market.spread_pct * market_price / 2.0,
+        )
+        breakeven = fee_cost + dynamic_slippage
         if opp.edge < breakeven:
             logger.info(
                 "RISK REJECT below_breakeven: %s | edge=%.4f < breakeven=%.4f "
-                "(fee=%.4f slip=%.4f) at P=%.3f",
+                "(fee=%.4f slip=%.4f [spread=%.3f]) at P=%.3f",
                 opp.market.ticker, opp.edge, breakeven,
-                fee_cost, self._cfg.estimated_slippage, market_price,
+                fee_cost, dynamic_slippage, opp.market.spread_pct, market_price,
             )
             return None
 
@@ -265,6 +301,28 @@ class RiskAgent:
             logger.info(
                 "RISK REJECT no_price_too_high: %s | no_ask=%.3f > %.2f cap",
                 opp.market.ticker, market_price, self._cfg.max_no_fill_price,
+            )
+            return None
+
+        # YES fill price cap — don't buy YES above max_yes_fill_price
+        if opp.side == Side.YES and market_price > self._cfg.max_yes_fill_price:
+            logger.info(
+                "RISK REJECT yes_price_too_high: %s | yes_ask=%.3f > %.2f cap",
+                opp.market.ticker, market_price, self._cfg.max_yes_fill_price,
+            )
+            return None
+
+        # Return-on-risk gate — edge must translate to a real % return on
+        # dollars at risk, not just a percentage-point delta. A 3.5pp edge on
+        # a 99¢ NO is only 3.5% RoR and is erased by ~1pp of model error;
+        # the same edge on a 50¢ contract is 7%. Closes the asymmetry hole
+        # that produced the 99¢ bracket-NO fills on 2026-05-06.
+        return_on_risk = opp.edge / market_price if market_price > 0 else 0.0
+        if return_on_risk < self._cfg.min_return_on_risk:
+            logger.info(
+                "RISK REJECT low_ror: %s | edge=%.4f / price=%.3f = %.3f < %.2f",
+                opp.market.ticker, opp.edge, market_price,
+                return_on_risk, self._cfg.min_return_on_risk,
             )
             return None
 
@@ -284,6 +342,19 @@ class RiskAgent:
         if opp.side == Side.NO:
             max_no_size = max_by_exposure * market_price
             size = min(size, max_no_size)
+
+        # 15M Up/Down contract cap — limit number of contracts to prevent
+        # catastrophic single-position losses (was 179 contracts → -$116).
+        is_15m = opp.market.ticker.upper().startswith(("KXBTC15M-", "KXETH15M-"))
+        if is_15m and market_price > 0:
+            max_15m_usd = self._cfg.max_15m_contracts * market_price
+            if size > max_15m_usd:
+                logger.info(
+                    "RISK CAP 15m_contract_limit: %s | size=%.0f → %.0f (max %d contracts × %.2f)",
+                    opp.market.ticker, size, max_15m_usd,
+                    self._cfg.max_15m_contracts, market_price,
+                )
+                size = max_15m_usd
 
         if size < 1.0:
             logger.info(

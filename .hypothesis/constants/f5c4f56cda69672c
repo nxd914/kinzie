@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/agents/scanner_agent.py
+# hypothesis_version: 6.141.1
+
+[0.0, 0.005, 0.02, 0.25, 0.3, 0.5, 1.0, 2.0, 2500.0, 3600.0, 120, 200, 400, 600, ' | ', '+00:00', ',', '-B(\\d+(?:\\.\\d+)?)$', '-T(\\d+(?:\\.\\d+)?)$', 'BTC', 'ETH', 'EXECUTION_MODE', 'KXBTC', 'KXETH', 'KXSOL', 'KXXRP', 'SCAN_CYCLE', 'SIGNAL_SCAN', 'SOL', 'XRP', 'Z', '^KX(BTC|ETH)15M-', 'atm_bracket', 'between', 'bitcoin', 'drift_sign_mismatch', 'ethereum', 'kelly_zero', 'kxbtc', 'kxeth', 'kxsol', 'kxxrp', 'less', 'liquidity', 'live', 'low_disagreement', 'low_edge', 'no_ask', 'no_bid', 'no_too_expensive', 'paper', 'periodic_scan', 'ripple', 'signal_scan', 'solana', 'thin_book', 'too_far_out', 'volume_24h', 'yes_ask', 'yes_bid', 'yes_too_expensive']

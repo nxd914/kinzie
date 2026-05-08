@@ -44,8 +44,12 @@ DEFAULT_KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_KALSHI_WS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 REQUEST_TIMEOUT = 10.0
 GET_429_MAX_RETRIES = 5
-POST_429_MAX_RETRIES = 3
-POST_429_MAX_DELAY = 5.0  # cap at 5s — skip trade rather than stall 30s
+POST_429_MAX_RETRIES = 5
+POST_429_MAX_DELAY = 15.0
+# Bumped from 3/5s → 5/15s. We have a 30s execution grace, so spending 15s on
+# rate-limit recovery is preferable to silently dropping the order. Caller now
+# distinguishes "_error: rate_limited" (don't release slot) from "_error: network"
+# (release slot — the POST never landed).
 _HTTP_BODY_LOG_MAX = 800
 
 
@@ -469,11 +473,11 @@ class KalshiClient:
                         await resp.read()
                         if attempt >= POST_429_MAX_RETRIES - 1:
                             logger.warning(
-                                "Kalshi rate limit (POST %s) — max retries (%d) exceeded, skipping",
+                                "Kalshi rate limit (POST %s) — max retries (%d) exceeded",
                                 path,
                                 POST_429_MAX_RETRIES,
                             )
-                            return {}
+                            return {"_error": "rate_limited"}
                         delay = min(POST_429_MAX_DELAY, 2.0**attempt)
                         logger.warning(
                             "Kalshi rate limit (POST %s) — sleeping %.1fs then retry %d/%d",
@@ -493,11 +497,11 @@ class KalshiClient:
                             resp.status,
                             body or "(empty)",
                         )
-                        return {}
+                        return {"_error": f"http_{resp.status}", "_body": body or ""}
                     return await resp.json()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 logger.warning("Kalshi POST %s transport error: %s", path, exc)
-                return {}
+                return {"_error": "network", "_detail": str(exc)}
 
     async def _delete(self, path: str) -> dict:
         if self._session is None:

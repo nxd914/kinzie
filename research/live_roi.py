@@ -108,6 +108,38 @@ def main() -> int:
     print(f"Cumulative settled P&L (last 200): ${pnl_total:+,.2f}")
     print(f"Today P&L:   ${pnl_today:+,.2f}  ({today_roi:+.3%} vs ${bankroll_basis:,.0f})")
 
+    # Per-family P&L breakdown
+    families: dict[str, dict] = {}
+    for s in settlements_all:
+        ticker = s.get("ticker") or s.get("market_ticker") or ""
+        ticker_upper = ticker.upper()
+        if "BTC" in ticker_upper:
+            fam = "BTC"
+        elif "ETH" in ticker_upper:
+            fam = "ETH"
+        elif "SOL" in ticker_upper:
+            fam = "SOL"
+        else:
+            fam = "Other"
+        if fam not in families:
+            families[fam] = {"pnl": 0.0, "wins": 0, "losses": 0, "total": 0}
+        pnl = _settlement_pnl(s)
+        families[fam]["pnl"] += pnl
+        families[fam]["total"] += 1
+        if pnl > 0:
+            families[fam]["wins"] += 1
+        elif pnl < 0:
+            families[fam]["losses"] += 1
+    if families:
+        print(f"\nP&L by family:")
+        print(f"  {'Family':8}  {'P&L':>10}  {'W':>4}  {'L':>4}  {'Rate':>6}")
+        print(f"  {'-'*8}  {'-'*10}  {'-'*4}  {'-'*4}  {'-'*6}")
+        for fam in sorted(families.keys()):
+            d = families[fam]
+            resolved = d["wins"] + d["losses"]
+            wr = d["wins"] / resolved if resolved else 0.0
+            print(f"  {fam:8}  ${d['pnl']:>+9.2f}  {d['wins']:>4}  {d['losses']:>4}  {wr:>5.1%}")
+
     if data["positions"]:
         print(f"\nOpen positions ({len(data['positions'])}):")
         print(f"  {'ticker':38}  {'YES':>4}  {'NO':>4}  {'exposure':>10}")

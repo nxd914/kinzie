@@ -45,6 +45,12 @@ POLL_INTERVAL_SECONDS = 60
 # WS fill event registers a position that Kalshi never actually opened.
 RECONCILE_EVERY_N_CYCLES = 1
 
+ORPHAN_RELEASE_CYCLES = 3
+# Number of consecutive reconcile cycles a RiskAgent slot must be invisible
+# to both Kalshi and PortfolioAgent before we force-release it. At a 60s
+# poll/reconcile cadence, that's ~3 minutes of grace for a slow Kalshi
+# ingest before we conclude the slot is phantom.
+
 
 class PortfolioAgent:
     def __init__(
@@ -63,6 +69,12 @@ class PortfolioAgent:
         self._known_tickers: set[str] = set()
         self._seen_settlement_keys: set[tuple[str, str]] = set()
         self._cycles_since_reconcile = 0
+        # Orphan-slot detection: ticker -> consecutive reconcile cycles that
+        # the ticker has been in RiskAgent._open_positions but invisible to
+        # both Kalshi (get_positions) AND PortfolioAgent (_known_tickers).
+        # Force-released after ORPHAN_RELEASE_CYCLES to break the phantom-slot
+        # leak from sub-$1 partial fills that never settle.
+        self._orphan_seen: dict[str, int] = {}
 
     async def run(self) -> None:
         await self._sync_initial()
@@ -243,6 +255,26 @@ class PortfolioAgent:
             self._risk.restore_position(ticker, cost)
             self._known_tickers.add(ticker)
             logger.info("PortfolioAgent: reconcile picked up %s | cost=$%.2f", ticker, cost)
+
+        # Orphan-slot sweep: tickers RiskAgent thinks are open but Kalshi
+        # doesn't see and PortfolioAgent never registered. After
+        # ORPHAN_RELEASE_CYCLES consecutive misses, force-release them.
+        risk_open = set(self._risk.open_position_tickers())
+        suspects = risk_open - kalshi_tickers - self._known_tickers
+        for ticker in suspects:
+            self._orphan_seen[ticker] = self._orphan_seen.get(ticker, 0) + 1
+            if self._orphan_seen[ticker] >= ORPHAN_RELEASE_CYCLES:
+                logger.warning(
+                    "PortfolioAgent: force-released orphan slot %s after %d cycles "
+                    "(in RiskAgent but not in Kalshi or PortfolioAgent)",
+                    ticker, self._orphan_seen[ticker],
+                )
+                self._risk.release_position(ticker)
+                self._orphan_seen.pop(ticker, None)
+        # Clear orphan counters for tickers that resolved on their own.
+        for ticker in list(self._orphan_seen.keys()):
+            if ticker not in suspects:
+                self._orphan_seen.pop(ticker, None)
 
 
 def _position_cost_usd(position: dict) -> float:

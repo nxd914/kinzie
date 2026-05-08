@@ -1,138 +1,63 @@
-"""
-Tests for quant/agents/crypto_feed_agent.py
-
-Covers:
-- Binance aggTrade message parsing
-- Coinbase ticker message parsing
-- Symbol normalization (BTCUSDT -> BTC, BTC-USD -> BTC)
--
- Malformed message handling
-"""
-
+import asyncio
 import json
 from datetime import datetime, timezone
-
 import pytest
 
 from strategies.crypto.agents.crypto_feed_agent import CryptoFeedAgent
 
 
-# ---------------------------------------------------------------------------
-# Binance parsing
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def agent():
+    return CryptoFeedAgent(asyncio.Queue())
 
 
-def _binance_agg_trade(symbol: str = "BTCUSDT", price: str = "67000.50", qty: str = "0.123") -> str:
-    return json.dumps({
-        "e": "aggTrade",
-        "E": 1713000000000,
-        "s": symbol,
-        "a": 123456,
-        "p": price,
-        "q": qty,
-        "f": 100,
-        "l": 200,
-        "T": 1713000000000,
-        "m": False,
-    })
+def _kraken_ticker(pair: str, price: str) -> str:
+    """Create a mock Kraken ticker message."""
+    return json.dumps([
+        119930888,
+        {
+            "a": ["79300.10000", 2, "2.79261056"],
+            "b": ["79300.00000", 0, "0.32492162"],
+            "c": [price, "0.00150667"],
+            "v": ["0.00000000", "1609.53129086"],
+            "p": ["0.00000", "80315.07912"],
+            "t": [0, 55257],
+            "l": ["0.00000", "79300.00000"],
+            "h": ["0.00000", "81705.00000"],
+            "o": ["0.00000", "81068.60000"]
+        },
+        "ticker",
+        pair
+    ])
 
 
-def test_binance_parse_btc():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_binance(_binance_agg_trade("BTCUSDT", "67000.50", "0.5"))
+def test_kraken_parse_btc(agent):
+    tick = agent._parse_kraken(_kraken_ticker("XBT/USD", "67000.50"))
     assert tick is not None
-    assert tick.exchange == "binance"
+    assert tick.exchange == "kraken"
     assert tick.symbol == "BTC"
     assert tick.price == 67000.50
-    assert tick.volume == 0.5
 
 
-def test_binance_parse_eth():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_binance(_binance_agg_trade("ETHUSDT", "3500.25", "1.0"))
+def test_kraken_parse_eth(agent):
+    tick = agent._parse_kraken(_kraken_ticker("ETH/USD", "3500.25"))
     assert tick is not None
+    assert tick.exchange == "kraken"
     assert tick.symbol == "ETH"
     assert tick.price == 3500.25
 
 
-def test_binance_parse_unknown_symbol():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_binance(_binance_agg_trade("DOGEUSDT", "0.15", "100"))
+def test_kraken_parse_unknown_symbol(agent):
+    tick = agent._parse_kraken(_kraken_ticker("DOGE/USD", "0.15"))
     assert tick is None
 
 
-def test_binance_parse_combined_stream():
-    """Combined streams wrap in {"stream": "...", "data": {...}}."""
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    inner = json.loads(_binance_agg_trade("BTCUSDT", "67000.00", "0.1"))
-    wrapped = json.dumps({"stream": "btcusdt@aggTrade", "data": inner})
-    tick = agent._parse_binance(wrapped)
-    assert tick is not None
-    assert tick.symbol == "BTC"
-
-
-def test_binance_parse_non_aggtrade_ignored():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_binance(json.dumps({"e": "kline", "s": "BTCUSDT"}))
+def test_kraken_parse_non_ticker_ignored(agent):
+    tick = agent._parse_kraken(json.dumps([123, {"a": "b"}, "trade", "XBT/USD"]))
     assert tick is None
 
 
-def test_binance_parse_malformed():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    assert agent._parse_binance("not json") is None
-    assert agent._parse_binance("{}") is None
-
-
-# ---------------------------------------------------------------------------
-# Coinbase parsing
-# ---------------------------------------------------------------------------
-
-
-def _coinbase_ticker(product_id: str = "BTC-USD", price: str = "67000.50") -> str:
-    return json.dumps({
-        "type": "ticker",
-        "sequence": 123,
-        "product_id": product_id,
-        "price": price,
-        "open_24h": "66000.00",
-        "volume_24h": "12345.67",
-        "low_24h": "65000.00",
-        "high_24h": "68000.00",
-        "best_bid": "66999.00",
-        "best_ask": "67001.00",
-        "last_size": "0.25",
-    })
-
-
-def test_coinbase_parse_btc():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_coinbase(_coinbase_ticker("BTC-USD", "67000.50"))
-    assert tick is not None
-    assert tick.exchange == "coinbase"
-    assert tick.symbol == "BTC"
-    assert tick.price == 67000.50
-    assert tick.volume == 0.25
-
-
-def test_coinbase_parse_eth():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_coinbase(_coinbase_ticker("ETH-USD", "3500.00"))
-    assert tick is not None
-    assert tick.symbol == "ETH"
-
-
-def test_coinbase_parse_unknown_product():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_coinbase(_coinbase_ticker("DOGE-USD", "0.15"))
-    assert tick is None
-
-
-def test_coinbase_parse_non_ticker_ignored():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    tick = agent._parse_coinbase(json.dumps({"type": "subscriptions"}))
-    assert tick is None
-
-
-def test_coinbase_parse_malformed():
-    agent = CryptoFeedAgent(tick_queue=None)  # type: ignore
-    assert agent._parse_coinbase("not json") is None
+def test_kraken_parse_malformed(agent):
+    assert agent._parse_kraken("not json") is None
+    assert agent._parse_kraken('{"not": "a list"}') is None
+    assert agent._parse_kraken('[123]') is None

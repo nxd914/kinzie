@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/agents/crypto_feed_agent.py
+# hypothesis_version: 6.141.1
+
+[1.0, 60.0, 1000.0, '+00:00', 'BTC', 'BTC-USD', 'BTCUSDT', 'ETH', 'ETH-USD', 'ETHUSDT', 'SOL', 'SOL-USD', 'SOLUSDT', 'T', 'XRP', 'XRP-USD', 'XRPUSDT', 'Z', 'aggTrade', 'binance', 'channels', 'coinbase', 'data', 'e', 'last_size', 'p', 'price', 'product_id', 'product_ids', 'q', 's', 'subscribe', 'ticker', 'time', 'type']

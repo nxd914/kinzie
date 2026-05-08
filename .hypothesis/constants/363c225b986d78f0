@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/agents/portfolio_agent.py
+# hypothesis_version: 6.141.1
+
+[0.0, 1.0, 100.0, 200, '+00:00', '?', 'Z', 'ask', 'count', 'count_fp', 'fee_cost', 'market_exposure', 'market_result', 'market_ticker', 'no', 'no_count', 'revenue', 'settle_time', 'settled_time', 'side', 'ticker', 'total_traded', 'yes_count', 'yes_price', 'yes_price_dollars']

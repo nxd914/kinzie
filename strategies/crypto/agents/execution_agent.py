@@ -15,11 +15,27 @@ Environment once and passes it in.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
+
+
+class OrderOutcome(NamedTuple):
+    """Terminal result of polling an order through grace.
+
+    terminal_status ∈ {FILLED, PARTIAL, REJECTED, TIMEOUT, CANCELLED}.
+    REJECTED means the exchange rejected; TIMEOUT means grace expired
+    with no fill and we cancelled. Conflating these in logs hid which
+    knob (cross-offset vs grace vs price-validity) was actually wrong.
+    """
+
+    filled_count: int
+    fill_price: float
+    terminal_status: str
+    reason: str
 
 from core.db import connect as db_connect
 from core.environment import Environment, resolve_environment
@@ -30,6 +46,45 @@ from ..core.models import Order, OrderStatus, Side, TradeOpportunity
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "paper_trades.db"
+
+
+def _extract_post_error_reason(post_error: Optional[str], resp: object) -> str:
+    """Pull a Kalshi `error.code` out of the POST error envelope.
+
+    `_post` returns `{"_error": "http_400", "_body": '{"error":{"code":...}}'}`
+    on rejection. We've been logging the whole blob and ignoring the code,
+    which is the only field that tells us *why* the price was invalid.
+    """
+    if post_error is None and not isinstance(resp, dict):
+        return ""
+    body = resp.get("_body") if isinstance(resp, dict) else None
+    if isinstance(body, str) and body:
+        try:
+            parsed = json.loads(body)
+            err = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(err, dict):
+                code = err.get("code") or err.get("message")
+                if code:
+                    return f"{post_error or 'http_error'}:{code}"
+        except (ValueError, TypeError):
+            pass
+    detail = resp.get("_detail") if isinstance(resp, dict) else None
+    if detail:
+        return f"{post_error or 'error'}:{str(detail)[:80]}"
+    return post_error or "no_order_id"
+
+
+def _extract_order_view_reason(order_view: dict) -> str:
+    """Best-effort: dig a reason field out of get_order's response."""
+    for key in ("reject_reason", "rejection_reason", "error", "error_message", "message"):
+        val = order_view.get(key)
+        if val:
+            if isinstance(val, dict):
+                code = val.get("code") or val.get("message")
+                if code:
+                    return str(code)[:120]
+            return str(val)[:120]
+    return ""
 
 
 class ExecutionAgent:
@@ -102,6 +157,11 @@ class ExecutionAgent:
             )
 
         now = datetime.now(tz=timezone.utc)
+        signal_ts = getattr(opp.signal, "timestamp", None)
+        signal_age_ms = (
+            int((now - signal_ts).total_seconds() * 1000) if signal_ts is not None else -1
+        )
+        loop_t0 = asyncio.get_event_loop().time()
 
         # Cross-the-spread offset: the cached ask is a snapshot from the
         # scanner pass and on thin Kalshi 15m books often gets eaten or
@@ -137,14 +197,14 @@ class ExecutionAgent:
 
         if opp.side == Side.YES:
             base_ask = live_yes_ask
-            fill_price = max(0.01, min(0.99, base_ask + cross_offset))
+            fill_price = round(max(0.01, min(0.99, base_ask + cross_offset)), 2)
             yes_price_dollars = fill_price
             stale_delta = live_yes_ask - cached_yes_ask
         else:
             base_ask = live_no_ask
-            no_price_dollars = max(0.01, min(0.99, base_ask + cross_offset))
+            no_price_dollars = round(max(0.01, min(0.99, base_ask + cross_offset)), 2)
             fill_price = no_price_dollars
-            yes_price_dollars = 1.0 - no_price_dollars
+            yes_price_dollars = round(1.0 - no_price_dollars, 2)
             stale_delta = live_no_ask - cached_no_ask
         if abs(stale_delta) >= 0.01:
             logger.info(
@@ -159,6 +219,7 @@ class ExecutionAgent:
         max_count_cap = 200
         count = max(1, min(max_count_cap, int(size_usdc / fill_price)))
 
+        post_t0 = asyncio.get_event_loop().time()
         try:
             resp = await self._kalshi.place_limit_order(
                 ticker=opp.market.ticker,
@@ -178,12 +239,33 @@ class ExecutionAgent:
                 error=str(exc),
             )
 
+        post_ms = int((asyncio.get_event_loop().time() - post_t0) * 1000)
+        pre_ms = int((post_t0 - loop_t0) * 1000)
+        logger.info(
+            "LATENCY %s | signal_age=%dms pre_post=%dms post=%dms",
+            opp.market.ticker, signal_age_ms, pre_ms, post_ms,
+        )
+
+        # Distinguish POST failure modes (set by kalshi_client._post):
+        #   _error=rate_limited → POST may have landed; reconcile via WS/poll
+        #   _error=network/http_* → POST never reached; safe to release slot
+        post_error = resp.get("_error") if isinstance(resp, dict) else None
         order_data = resp.get("order", resp)
         order_id = order_data.get("order_id") or order_data.get("id")
 
         if not order_id:
-            error_msg = str(resp)[:200]
-            logger.error("Live order rejected for %s: %s", opp.market.ticker, error_msg)
+            reason = _extract_post_error_reason(post_error, resp)
+            error_msg = f"{post_error or 'no_order_id'}: {str(resp)[:180]}"
+            log_fn = logger.warning if post_error == "rate_limited" else logger.error
+            log_fn(
+                "Live order rejected for %s: %s | reason=%s",
+                opp.market.ticker, error_msg, reason,
+            )
+            edge_v = getattr(opp, "edge", 0.0)
+            logger.info(
+                "Order outcome | %s | edge=%.3f | filled=0/? | status=REJECTED | reason=%s",
+                opp.market.ticker, edge_v, reason,
+            )
             return Order(
                 opportunity=opp,
                 size_usdc=size_usdc,
@@ -197,18 +279,23 @@ class ExecutionAgent:
         # fill_count=0 even for orders that will match a moment later.
         # Poll get_order(order_id) until we see a fill OR the grace window
         # expires; only then cancel. Records FILLED only when Kalshi confirms.
-        filled_count, fill_price_actual = await self._await_fill_or_cancel(
+        outcome = await self._await_fill_or_cancel(
             order_id=str(order_id),
             requested_count=count,
             limit_price=fill_price,
         )
+        filled_count = outcome.filled_count
+        fill_price_actual = outcome.fill_price
 
         edge = getattr(opp, "edge", 0.0)
         if filled_count <= 0:
+            # TIMEOUT vs REJECTED matters: TIMEOUT → grace/cross-offset levers;
+            # REJECTED → price validity / exchange-side rule. Log them apart.
             logger.info(
-                "Order outcome | %s | edge=%.3f | grace=%.1fs | filled=0/%d | status=REJECTED",
+                "Order outcome | %s | edge=%.3f | grace=%.1fs | filled=0/%d | status=%s | reason=%s",
                 opp.market.ticker, edge,
                 self._cfg.execution_fill_grace_seconds, count,
+                outcome.terminal_status, outcome.reason or "-",
             )
             return Order(
                 opportunity=opp,
@@ -216,7 +303,7 @@ class ExecutionAgent:
                 status=OrderStatus.REJECTED,
                 fill_price=None,
                 placed_at=now,
-                error=f"grace_expired count={count} fill_count=0",
+                error=f"{outcome.terminal_status.lower()} count={count} reason={outcome.reason or '-'}",
             )
 
         actual_size = filled_count * fill_price_actual
@@ -241,11 +328,13 @@ class ExecutionAgent:
         order_id: str,
         requested_count: int,
         limit_price: float,
-    ) -> tuple[int, float]:
+    ) -> OrderOutcome:
         """Poll the order until filled or grace window elapses; cancel if stale.
 
-        Returns (filled_count, effective_fill_price). filled_count may be
-        partial; if zero, the order has been cancelled.
+        Returns an OrderOutcome carrying terminal_status (FILLED, PARTIAL,
+        REJECTED, CANCELLED, TIMEOUT) and any reason string the exchange
+        surfaced. filled_count may be partial; on zero, the order has
+        either been rejected by the exchange or cancelled by us.
         """
         deadline = asyncio.get_event_loop().time() + self._cfg.execution_fill_grace_seconds
         poll_every = max(0.1, self._cfg.execution_fill_poll_interval_seconds)
@@ -278,10 +367,27 @@ class ExecutionAgent:
                         fill_price_actual = float(avg_cents) / 100.0
                     except (TypeError, ValueError):
                         pass
-                return filled_count, fill_price_actual
+                terminal = "FILLED" if filled_count >= requested_count else "PARTIAL"
+                return OrderOutcome(filled_count, fill_price_actual, terminal, "")
 
             if status_str in ("canceled", "cancelled", "expired", "rejected"):
-                return 0, limit_price
+                reason = _extract_order_view_reason(order_view)
+                if status_str == "rejected" and not reason:
+                    # Surface the full view once so we can learn what
+                    # field (if any) Kalshi populates on rejection.
+                    logger.warning(
+                        "get_order(%s) returned rejected with no reason; view=%s",
+                        order_id, str(order_view)[:300],
+                    )
+                terminal_map = {
+                    "canceled": "CANCELLED",
+                    "cancelled": "CANCELLED",
+                    "expired": "CANCELLED",
+                    "rejected": "REJECTED",
+                }
+                return OrderOutcome(
+                    0, limit_price, terminal_map[status_str], reason,
+                )
 
             if asyncio.get_event_loop().time() >= deadline:
                 break
@@ -293,7 +399,7 @@ class ExecutionAgent:
             await self._kalshi.cancel_order(order_id)
         except Exception as exc:
             logger.warning("cancel_order failed for %s: %s", order_id, exc)
-        return 0, limit_price
+        return OrderOutcome(0, limit_price, "TIMEOUT", "grace_expired")
 
     def _persist(self, order: Order) -> None:
         opp = order.opportunity

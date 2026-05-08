@@ -26,6 +26,54 @@ VOL_WINDOW_LONG_SECONDS = 900.0      # 15-minute lookback for pricing vol (more 
 MIN_TICKS_FOR_FEATURES = 10          # minimum observations before emitting
 JUMP_RETURN_THRESHOLD = 0.002        # 0.2% return in window -> jump
 ANNUALIZATION_FACTOR = math.sqrt(365 * 24 * 3600)  # per-second vol -> annual
+SECONDS_PER_YEAR = 365 * 24 * 3600   # per-second drift -> annualized drift
+
+# EWMA drift half-lives. Short for ≤15min horizons (15M Up/Down), long for ≥1h.
+EWMA_DRIFT_SHORT_HALF_LIFE_S = 15.0  # 15s: fast response for 15M contracts
+EWMA_DRIFT_LONG_HALF_LIFE_S = 300.0  # 5min: stable for hourly+ contracts
+MAX_DRIFT_ANNUALIZED = 5.0           # cap |drift| at ±500%/yr
+
+
+class EwmaDrift:
+    """Exponentially weighted moving average of log-return drift.
+
+    Tracks annualized drift via EWMA with configurable half-life.
+    Used by the pricing model to estimate directional momentum
+    for the N(d2) disagreement gate.
+    """
+
+    def __init__(self, half_life_seconds: float = EWMA_DRIFT_SHORT_HALF_LIFE_S) -> None:
+        self._alpha = math.log(2) / max(half_life_seconds, 1e-9)
+        self._ewma: float = 0.0
+        self._last_price: float = 0.0
+        self._last_ts: float = 0.0
+        self._initialized: bool = False
+
+    @property
+    def annualized_drift(self) -> float:
+        """Current EWMA drift estimate, annualized and capped."""
+        raw = self._ewma * SECONDS_PER_YEAR
+        return max(-MAX_DRIFT_ANNUALIZED, min(MAX_DRIFT_ANNUALIZED, raw))
+
+    def push(self, price: float, ts: float) -> None:
+        """Ingest a new price tick and update the EWMA."""
+        if price <= 0:
+            return
+        if not self._initialized:
+            self._last_price = price
+            self._last_ts = ts
+            self._initialized = True
+            return
+        dt = ts - self._last_ts
+        if dt <= 0:
+            return
+        log_ret = math.log(price / self._last_price)
+        drift_per_sec = log_ret / dt
+        # EWMA update: weight = 1 - exp(-alpha * dt)
+        w = 1.0 - math.exp(-self._alpha * dt)
+        self._ewma = (1.0 - w) * self._ewma + w * drift_per_sec
+        self._last_price = price
+        self._last_ts = ts
 
 
 class RollingWindow:
@@ -104,7 +152,7 @@ class RollingWindow:
         target_ts = now_ts - seconds_ago
 
         # Walk backward to find the closest tick at or before target_ts
-        for ts, price in self._ticks:
+        for ts, price in reversed(self._ticks):
             if ts <= target_ts and price > 0:
                 return (current_price - price) / price
 
@@ -152,6 +200,8 @@ def compute_features(
     tick: Tick,
     short_window_seconds: float = SHORT_RETURN_WINDOW_SECONDS,
     long_window: Optional[RollingWindow] = None,
+    drift_short: Optional[EwmaDrift] = None,
+    drift_long: Optional[EwmaDrift] = None,
 ) -> Optional[FeatureVector]:
     """
     Compute a FeatureVector from rolling window state after ingesting a tick.
@@ -164,6 +214,8 @@ def compute_features(
         tick: latest price tick
         short_window_seconds: lookback for short return
         long_window: optional 15-minute rolling window (for pricing vol)
+        drift_short: optional EWMA drift tracker (short half-life)
+        drift_long: optional EWMA drift tracker (long half-life)
     """
     if window.count < MIN_TICKS_FOR_FEATURES:
         return None
@@ -189,6 +241,10 @@ def compute_features(
     if realized_vol_long <= 0.0:
         realized_vol_long = realized_vol
 
+    # EWMA drift values (annualized)
+    ewma_drift_short_val = drift_short.annualized_drift if drift_short else 0.0
+    ewma_drift_long_val = drift_long.annualized_drift if drift_long else 0.0
+
     return FeatureVector(
         symbol=tick.symbol,
         timestamp=tick.timestamp,
@@ -198,4 +254,6 @@ def compute_features(
         realized_vol_long=realized_vol_long,
         jump_detected=jump_detected,
         momentum_z=momentum_z,
+        ewma_drift_short=ewma_drift_short_val,
+        ewma_drift_long=ewma_drift_long_val,
     )

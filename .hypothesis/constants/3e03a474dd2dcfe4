@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/core/features.py
+# hypothesis_version: 6.141.1
+
+[0.0, 0.002, 0.5, 1.0, 2.0, 5.0, 30.0, 60.0, 300.0, 900.0, 365, 3600, '_ewma', '_half_life', '_initialized', '_last_price', '_last_ts']

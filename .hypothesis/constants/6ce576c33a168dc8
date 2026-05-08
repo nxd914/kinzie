@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/core/config.py
+# hypothesis_version: 6.141.1
+
+[0.002, 0.005, 0.008, 0.01, 0.04, 0.05, 0.07, 0.1, 0.2, 0.25, 0.3, 0.4, 0.45, 0.5, 0.55, 0.99, 1.0, 2.0, 5.0, 30.0, 60.0, 900.0, 100, 120, 300, 600, '1', 'ENABLE_BRACKETS', 'ENABLE_THRESHOLDS', 'ESTIMATED_SLIPPAGE', 'KELLY_FRACTION_CAP', 'MAX_DAILY_LOSS_PCT', 'MAX_NO_FILL_PRICE', 'MIN_EDGE', 'MIN_FILLS_FOR_LIVE', 'MIN_KELLY', 'MIN_NO_FILL_PRICE', 'MIN_SHARPE_FOR_LIVE', 'MIN_SPREAD_PCT', 'on', 'true', 'yes']

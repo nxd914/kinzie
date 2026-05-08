@@ -56,8 +56,11 @@ def test_spot_to_implied_prob_drift_zero_is_backward_compatible():
 
 def test_spot_to_implied_prob_positive_drift_raises_otm_yes_prob():
     """Positive drift (price expected to rise) should raise P(spot > strike) for OTM strike."""
-    base = spot_to_implied_prob(60000.0, 70000.0, 24.0, 0.5, drift=0.0)
-    drifted = spot_to_implied_prob(60000.0, 70000.0, 24.0, 0.5, drift=2.0)
+    # Use a mildly OTM strike so we stay above the PROB_FLOOR clamp for both
+    # the base and drifted cases (otherwise both saturate to PROB_FLOOR and
+    # the directional sensitivity is invisible).
+    base = spot_to_implied_prob(68000.0, 70000.0, 24.0, 0.5, drift=0.0)
+    drifted = spot_to_implied_prob(68000.0, 70000.0, 24.0, 0.5, drift=2.0)
     assert drifted > base
 
 

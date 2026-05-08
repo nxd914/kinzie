@@ -16,7 +16,14 @@ import asyncio
 import logging
 from typing import Optional
 
-from ..core.features import RollingWindow, VOL_WINDOW_LONG_SECONDS, compute_features
+from ..core.features import (
+    EWMA_DRIFT_LONG_HALF_LIFE_S,
+    EWMA_DRIFT_SHORT_HALF_LIFE_S,
+    EwmaDrift,
+    RollingWindow,
+    VOL_WINDOW_LONG_SECONDS,
+    compute_features,
+)
 from ..core.models import FeatureVector, Signal, Tick
 from ..core.pricing import features_to_signal
 
@@ -45,6 +52,8 @@ class FeatureAgent:
         self._signals = signal_queue
         self._windows: dict[str, RollingWindow] = {}
         self._windows_long: dict[str, RollingWindow] = {}
+        self._drift_short: dict[str, EwmaDrift] = {}
+        self._drift_long: dict[str, EwmaDrift] = {}
         self.latest_features: dict[str, FeatureVector] = {}
 
     async def run(self) -> None:
@@ -66,13 +75,27 @@ class FeatureAgent:
             self._windows[symbol] = RollingWindow()
         if symbol not in self._windows_long:
             self._windows_long[symbol] = RollingWindow(max_age_seconds=VOL_WINDOW_LONG_SECONDS)
+        if symbol not in self._drift_short:
+            self._drift_short[symbol] = EwmaDrift(EWMA_DRIFT_SHORT_HALF_LIFE_S)
+        if symbol not in self._drift_long:
+            self._drift_long[symbol] = EwmaDrift(EWMA_DRIFT_LONG_HALF_LIFE_S)
 
         window = self._windows[symbol]
         window_long = self._windows_long[symbol]
+        drift_short = self._drift_short[symbol]
+        drift_long = self._drift_long[symbol]
         window.push(tick.price, ts)
         window_long.push(tick.price, ts)
+        drift_short.push(tick.price, ts)
+        drift_long.push(tick.price, ts)
 
-        features = compute_features(window, tick, long_window=window_long)
+        features = compute_features(
+            window,
+            tick,
+            long_window=window_long,
+            drift_short=drift_short,
+            drift_long=drift_long,
+        )
         if features is None:
             return None
 

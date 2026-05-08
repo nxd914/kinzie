@@ -190,6 +190,7 @@ async def main() -> None:
         price_cache=ws_agent.price_cache,
         crypto_features=feature_agent.latest_features,
         min_edge=config.min_edge,
+        config=config,
     )
     risk = RiskAgent(
         opportunity_queue=scanner_out_queue,

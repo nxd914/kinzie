@@ -19,7 +19,7 @@ from .models import FeatureVector, Signal, SignalType
 JUMP_RETURN_THRESHOLD = 0.002   # 0.2% return in short window → potential jump
 MOMENTUM_Z_THRESHOLD = 2.0      # z-score threshold to fire signal
 MIN_CONFIDENCE = 0.55           # minimum confidence to pass signal downstream
-BRACKET_CALIBRATION = 0.55      # haircut for bracket prob: N(d2) overestimates narrow brackets due to discrete jumps + CF Benchmark averaging. Lowered from 0.70 after -$31k paper loss analysis (model=0.81 vs market=0.51 on ATM brackets).
+BRACKET_CALIBRATION = 0.45      # haircut for bracket prob. Lowered 0.55→0.45 after live data showed phantom 15-17% edge on ATM strikes that Kalshi MMs would not match.
 MIN_TIME_TO_EXPIRY_HOURS = 1.0 / 60.0  # 1-minute floor; prevents d2 singularity as t→0 (scanner guards at 5min but race condition exists between scan and execution)
 
 
@@ -105,9 +105,13 @@ def bracket_prob(
     return max(0.0, (prob_above_floor - prob_above_cap) * BRACKET_CALIBRATION)
 
 
+PROB_FLOOR = 0.001  # clamp N(d2) tails to suppress float-underflow phantom edge on far-OTM/ITM strikes
+
+
 def _standard_normal_cdf(x: float) -> float:
-    """Approximation of N(x) using math.erfc."""
-    return 0.5 * math.erfc(-x / math.sqrt(2))
+    """Approximation of N(x) using math.erfc, clamped to [PROB_FLOOR, 1 - PROB_FLOOR]."""
+    p = 0.5 * math.erfc(-x / math.sqrt(2))
+    return min(1.0 - PROB_FLOOR, max(PROB_FLOOR, p))
 
 
 def features_to_signal(features: FeatureVector) -> Signal | None:

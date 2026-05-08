@@ -56,6 +56,8 @@ class FeatureVector:
     jump_detected: bool       # True if return exceeds jump threshold
     momentum_z: float         # z-score of short return vs rolling mean
     realized_vol_long: float = 0.0  # rolling annualized vol (15min window, for pricing). Falls back to realized_vol if 0.
+    ewma_drift_short: float = 0.0   # annualized EWMA log-return drift (30s half-life). Used for ≤15min horizons.
+    ewma_drift_long: float = 0.0    # annualized EWMA log-return drift (5min half-life). Used for ≥1h horizons.
 
 
 @dataclass(frozen=True)

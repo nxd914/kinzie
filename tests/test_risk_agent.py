@@ -10,6 +10,7 @@ Covers:
 
 import asyncio
 import pytest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from strategies.crypto.agents.risk_agent import RiskAgent
@@ -29,7 +30,9 @@ from strategies.crypto.core.models import (
 # ---------------------------------------------------------------------------
 
 def _make_opp(ticker: str, spread: float = DEFAULT_CONFIG.min_spread_pct + 0.01, edge: float = 0.1) -> TradeOpportunity:
-    mid = 0.50
+    # mid=0.30 → yes_ask≈0.325 (within max_yes_fill_price=0.40)
+    # edge=0.10 at price≈0.325 → RoR≈31% (clears 10% floor)
+    mid = 0.30
     half = spread / 2
     market = KalshiMarket(
         ticker=ticker,
@@ -61,7 +64,10 @@ def _make_opp(ticker: str, spread: float = DEFAULT_CONFIG.min_spread_pct + 0.01,
 
 
 def _make_agent() -> RiskAgent:
-    agent = RiskAgent(asyncio.Queue(), asyncio.Queue(), bankroll_usdc=500.0)
+    # Pin max_daily_loss_pct=0.20 to keep proactive-exposure tests deterministic
+    # against the production default (which is intentionally permissive in demo).
+    cfg = replace(DEFAULT_CONFIG, max_daily_loss_pct=0.20)
+    agent = RiskAgent(asyncio.Queue(), asyncio.Queue(), bankroll_usdc=500.0, config=cfg)
     agent.mark_seeded()
     return agent
 
@@ -272,8 +278,9 @@ async def test_breakeven_gate_approves_sufficient_edge():
     cfg = Config(estimated_slippage=0.005)
     agent = RiskAgent(asyncio.Queue(), asyncio.Queue(), bankroll_usdc=500.0, config=cfg)
     agent.mark_seeded()
-    # At P=0.5: breakeven = 0.0225; edge=0.10 passes
-    opp = _make_opp_at_price("ABOVE", price=0.50, edge=0.10)
+    # At P=0.35: breakeven ≈ fee(0.016) + slip(0.005) = 0.021; edge=0.10 passes
+    # Price=0.35 is within max_yes_fill_price=0.40
+    opp = _make_opp_at_price("ABOVE", price=0.35, edge=0.10)
     assert agent._evaluate(opp) is not None
 
 
@@ -522,6 +529,76 @@ async def test_expiry_concentration_slot_freed_after_resolve():
 # ---------------------------------------------------------------------------
 # Startup-seed gate (closes the cross-restart per-expiry duplication race)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Return-on-risk gate (asymmetry guard for extreme prices, e.g. 99¢ NO)
+# ---------------------------------------------------------------------------
+
+def _make_no_opp_with_edge(ticker: str, no_ask: float, edge: float) -> TradeOpportunity:
+    """Build a NO-side opportunity with explicit no_ask and edge."""
+    spread = DEFAULT_CONFIG.min_spread_pct + 0.01
+    mid = 0.50
+    half = spread / 2
+    market = KalshiMarket(
+        ticker=ticker,
+        title="RoR test",
+        event_ticker="",
+        yes_bid=mid - half,
+        yes_ask=mid + half,
+        no_bid=max(0.01, no_ask - 0.01),
+        no_ask=no_ask,
+        implied_prob=mid,
+        spread_pct=spread,
+        volume_24h=5000,
+        liquidity=2000,
+        close_time="",
+        timestamp=datetime.now(tz=timezone.utc),
+    )
+    fv = FeatureVector("SYM", datetime.now(tz=timezone.utc), 0.0, 0.0, 0.0, False, 0.0)
+    sig = Signal(SignalType.MOMENTUM_DOWN, "SYM", datetime.now(tz=timezone.utc), fv, 0.1, 0.9, ())
+    return TradeOpportunity(
+        signal=sig,
+        market=market,
+        side=Side.NO,
+        model_prob=0.5 - edge,
+        market_prob=mid,
+        edge=edge,
+        kelly_fraction=0.1,
+        capped_fraction=0.1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_low_ror_rejects_thin_edge_at_high_price():
+    """NO at 0.80 with edge=0.05 → RoR=6.25%, below 10% floor → reject."""
+    agent = _make_agent()
+    opp = _make_no_opp_with_edge("KXBTC-LOW-ROR", no_ask=0.80, edge=0.05)
+    assert agent._evaluate(opp) is None
+
+
+@pytest.mark.asyncio
+async def test_low_ror_rejects_99c_no_with_passing_pp_edge():
+    """The exact failure mode from the screenshot: 99¢ NO with a 3.5pp edge.
+
+    The price cap (max_no_fill_price=0.85) catches this first, but if it
+    were ever loosened, the RoR gate is the second line of defense:
+    edge=0.035 / price=0.99 = 3.5% < 10% → reject.
+    """
+    from strategies.crypto.core.config import Config
+    cfg = replace(DEFAULT_CONFIG, max_daily_loss_pct=0.20, max_no_fill_price=0.99)
+    agent = RiskAgent(asyncio.Queue(), asyncio.Queue(), bankroll_usdc=500.0, config=cfg)
+    agent.mark_seeded()
+    opp = _make_no_opp_with_edge("KXBTC-99c-NO", no_ask=0.99, edge=0.035)
+    assert agent._evaluate(opp) is None
+
+
+@pytest.mark.asyncio
+async def test_ror_passes_at_moderate_price_and_edge():
+    """NO at 0.50 with edge=0.10 → RoR=20%, well above 10% floor → pass."""
+    agent = _make_agent()
+    opp = _make_no_opp_with_edge("KXBTC-OK-ROR", no_ask=0.50, edge=0.10)
+    assert agent._evaluate(opp) is not None
+
 
 @pytest.mark.asyncio
 async def test_pre_seed_approvals_are_rejected():

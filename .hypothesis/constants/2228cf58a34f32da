@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/agents/websocket_agent.py
+# hypothesis_version: 6.141.1
+
+[0.0, 1.0, 60.0, 100.0, 1000, 'count_fp', 'fill', 'last_price', 'liquidity', 'market_ticker', 'msg', 'no_ask', 'no_bid', 'order_id', 'side', 'ticker', 'ts', 'type', 'volume_24h', 'yes_ask', 'yes_bid', 'yes_price_dollars']

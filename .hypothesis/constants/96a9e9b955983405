@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/core/models.py
+# hypothesis_version: 6.141.1
+
+[0.0, 'CANCELLED', 'FILLED', 'MOMENTUM_DOWN', 'MOMENTUM_UP', 'NO', 'PENDING', 'REJECTED', 'YES']

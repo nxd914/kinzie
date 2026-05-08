@@ -1,0 +1,4 @@
+# file: /Users/noahdonovan/kinzie/strategies/crypto/agents/risk_agent.py
+# hypothesis_version: 6.141.1
+
+[0.0, 0.01, 1.0, 100, '%Y-%m-%d %H:%M', '-', 'BTC', 'Daily P&L reset', 'ETH', 'KXBTC', 'KXBTC15M', 'KXBTC15M-', 'KXETH', 'KXETH15M', 'KXETH15M-', 'KXSOL', 'KXXRP', 'SOL', 'XRP']
