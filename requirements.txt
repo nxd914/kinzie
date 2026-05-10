@@ -1,1 +1,5 @@
-# No dependencies — static file server uses Python stdlib only
+aiohttp>=3.9
+lightning>=2.2
+python-dotenv>=1.0.0
+torch>=2.2
+websockets>=14.0

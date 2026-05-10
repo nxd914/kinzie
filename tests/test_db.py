@@ -1,10 +1,6 @@
 """Tests for core/db.py — WAL connect helper."""
 
 import sqlite3
-import tempfile
-from pathlib import Path
-
-import pytest
 
 from core.db import connect
 

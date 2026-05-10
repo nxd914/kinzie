@@ -1,12 +1,4 @@
-"""
-Main orchestrator — wires all agents together and runs the event loop.
-
-Usage:
-  EXECUTION_MODE=paper python3 -m strategies.crypto.daemon
-
-Environment variables:
-  EXECUTION_MODE    paper (default) | live
-"""
+"""Daemon entry point for Kraken L2 ingestion."""
 
 from __future__ import annotations
 
@@ -14,17 +6,23 @@ import asyncio
 import logging
 import os
 import signal
-from datetime import datetime, timezone
+from collections.abc import Awaitable
 from pathlib import Path
-from typing import Awaitable
 
-from core.environment import log_environment_banner, resolve_environment
-from core.kalshi_client import KalshiClient
+from .agents import CryptoFeedAgent
+from .core.config import Config
+from .core.l2_store import L2JsonlWriter
 from .core.logging import configure_logging
+from .core.models import L2Snapshot
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
+_PID_PATH = Path("data/microstructure.pid")
+_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
 def _load_project_dotenv() -> None:
-    """Load `.env` from repo root so the daemon sees API keys without manual export."""
     try:
         from dotenv import load_dotenv
     except ImportError:
@@ -36,43 +34,7 @@ def _load_project_dotenv() -> None:
     load_dotenv(override=False)
 
 
-_load_project_dotenv()
-
-from .agents import (  # noqa: E402
-    CryptoFeedAgent,
-    ExecutionAgent,
-    FeatureAgent,
-    PortfolioAgent,
-    RiskAgent,
-    ScannerAgent,
-    WebsocketAgent,
-)
-from .core.config import Config  # noqa: E402
-from .core.models import Signal, Tick, TradeOpportunity  # noqa: E402
-
-configure_logging()
-logger = logging.getLogger(__name__)
-
-TRACKED_SYMBOLS: list[str] = os.environ.get("TRACKED_SYMBOLS", "BTC,ETH").split(",")
-ORDER_GROUP_LIMIT = int(os.environ.get("ORDER_GROUP_CONTRACTS_LIMIT", "300"))
-_FALLBACK_BANKROLL = 1000.0  # used only if balance fetch fails at startup
-_SHUTDOWN_TIMEOUT_SECONDS = 10.0
-_PID_PATH = Path(__file__).resolve().parents[2] / "data" / "paper_fund.pid"
-_WATCHDOG_CHECK_SECONDS = 300    # check scanner health every 5 min
-_SCAN_STALE_THRESHOLD_SECONDS = 1800  # alert if no scan in 30 min during trading hours
-_BANKROLL_REFRESH_SECONDS = 60
-
-
-def _is_trading_hours(cfg: Config) -> bool:
-    """Match ScannerAgent: same UTC window as Config.trading_*_hour_utc."""
-    hour = datetime.now(tz=timezone.utc).hour
-    start, end = cfg.trading_start_hour_utc, cfg.trading_end_hour_utc
-    if start <= end:
-        return start <= hour < end
-    return hour >= start or hour < end
-
-
-async def _guarded(coro: Awaitable, name: str) -> None:
+async def _guarded(coro: Awaitable[None], name: str) -> None:
     try:
         await coro
     except asyncio.CancelledError:
@@ -82,196 +44,66 @@ async def _guarded(coro: Awaitable, name: str) -> None:
         raise
 
 
-async def _bankroll_refresher(
-    risk: RiskAgent,
-    scanner: ScannerAgent,
-    api_key: str,
-    private_key_path: str,
-    base_url: str,
-) -> None:
-    """Poll Kalshi for the live account balance every minute and update RiskAgent."""
-    client = KalshiClient(
-        api_key=api_key,
-        private_key_path=private_key_path,
-        base_url=base_url,
-    )
-    await client.open()
-    try:
-        while True:
-            try:
-                balance = await client.get_balance()
-                risk.set_bankroll(balance)
-                scanner.set_bankroll(balance)
-            except Exception as exc:
-                logger.warning("Bankroll refresh failed: %s", exc)
-            await asyncio.sleep(_BANKROLL_REFRESH_SECONDS)
-    finally:
-        await client.close()
-
-
-async def _watchdog(scanner: ScannerAgent, config: Config) -> None:
-    await asyncio.sleep(120)  # let scanner warm up before first check
+async def _drain_snapshots(snapshot_queue: asyncio.Queue[L2Snapshot]) -> None:
+    count = 0
     while True:
-        await asyncio.sleep(_WATCHDOG_CHECK_SECONDS)
-        if not _is_trading_hours(config):
-            continue
-        last_ts = scanner.last_scan_ts
-        if last_ts is None:
-            logger.warning("[kinzie] Scanner has not completed a scan since startup")
-            continue
-        age = (datetime.now(tz=timezone.utc) - last_ts).total_seconds()
-        if age > _SCAN_STALE_THRESHOLD_SECONDS:
-            logger.warning(
-                "[kinzie] No scanner activity for %.0f min during trading hours", age / 60
+        snapshot = await snapshot_queue.get()
+        count += 1
+        if count % 1000 == 0:
+            logger.info(
+                "Ingested %d L2 snapshots without persistence; latest=%s seq=%d",
+                count,
+                snapshot.symbol,
+                snapshot.sequence,
             )
+        snapshot_queue.task_done()
 
 
 async def main() -> None:
+    _load_project_dotenv()
     config = Config.from_env()
     config.validate()
-    env = resolve_environment()
-    log_environment_banner(env)
 
     _PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _PID_PATH.write_text(str(os.getpid()))
+    _PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
 
-    # Queues
-    tick_queue: asyncio.Queue[Tick] = asyncio.Queue(maxsize=5000)
-    signal_queue: asyncio.Queue[Signal] = asyncio.Queue(maxsize=200)
-    scanner_out_queue: asyncio.Queue[TradeOpportunity] = asyncio.Queue(maxsize=100)
-    approved_queue: asyncio.Queue[tuple[TradeOpportunity, float]] = asyncio.Queue(maxsize=50)
-
-    # Bootstrap: fetch live balance + create order group before constructing agents.
-    # Balance is always pulled from the account — no static config value.
-    order_group_id: str | None = None
-    initial_bankroll = _FALLBACK_BANKROLL
-    try:
-        async with KalshiClient(
-            api_key=env.api_key,
-            private_key_path=env.private_key_path,
-            base_url=env.rest_base_url,
-        ) as bootstrap_client:
-            try:
-                initial_bankroll = await bootstrap_client.get_balance()
-            except Exception as exc:
-                logger.warning("Balance fetch failed at startup: %s — using fallback $%.2f", exc, _FALLBACK_BANKROLL)
-            order_group_id = await bootstrap_client.create_order_group(ORDER_GROUP_LIMIT)
-        if order_group_id:
-            logger.info(
-                "Order group created: id=%s | rolling 15s cap=%d contracts",
-                order_group_id,
-                ORDER_GROUP_LIMIT,
-            )
-        else:
-            logger.warning("Order group creation returned no id — orders will not be group-bound.")
-    except Exception as exc:
-        logger.warning("Order group creation failed: %s — proceeding without group binding.", exc)
-
-    logger.info(
-        "Starting | mode=%s | bankroll=%.2f USDC | min_edge=%.2f | max_positions=%d",
-        env.label,
-        initial_bankroll,
-        config.min_edge,
-        config.max_concurrent_positions,
-    )
-
-    # Agents
-    crypto_feed = CryptoFeedAgent(tick_queue=tick_queue, symbols=TRACKED_SYMBOLS)
-    feature_agent = FeatureAgent(
-        tick_queue=tick_queue,
-        signal_queue=signal_queue,
-        config=config,
-    )
-
-    ws_agent = WebsocketAgent(
-        api_key=env.api_key,
-        private_key_path=env.private_key_path,
-        ws_url=env.ws_base_url,
-    )
-    scanner = ScannerAgent(
-        signal_queue=signal_queue,
-        opportunity_queue=scanner_out_queue,
-        bankroll_usdc=initial_bankroll,
-        price_cache=ws_agent.price_cache,
-        crypto_features=feature_agent.latest_features,
-        config=config,
-    )
-    risk = RiskAgent(
-        opportunity_queue=scanner_out_queue,
-        approved_queue=approved_queue,
-        bankroll_usdc=initial_bankroll,
-        config=config,
-    )
-
-    execution = ExecutionAgent(
-        approved_queue=approved_queue,
-        risk_agent=risk,
-        environment=env,
-        config=config,
-    )
-    if order_group_id:
-        execution._order_group_id = order_group_id  # type: ignore[attr-defined]
-
-    portfolio_client = KalshiClient(
-        api_key=env.api_key,
-        private_key_path=env.private_key_path,
-        base_url=env.rest_base_url,
-    )
-    await portfolio_client.open()
-    portfolio = PortfolioAgent(
-        risk_agent=risk,
-        websocket_agent=ws_agent,
-        kalshi_client=portfolio_client,
-        config=config,
-    )
+    snapshot_queue: asyncio.Queue[L2Snapshot] = asyncio.Queue(maxsize=config.snapshot_queue_size)
+    feed = CryptoFeedAgent(snapshot_queue=snapshot_queue, symbols=config.symbols, depth=config.book_depth)
 
     tasks = [
-        asyncio.create_task(_guarded(crypto_feed.run(), "crypto_feed"), name="crypto_feed"),
-        asyncio.create_task(_guarded(feature_agent.run(), "features"), name="features"),
-        asyncio.create_task(_guarded(ws_agent.run(), "kalshi_ws"), name="kalshi_ws"),
-        asyncio.create_task(_guarded(scanner.run(), "scanner"), name="scanner"),
-        asyncio.create_task(_guarded(risk.run(), "risk"), name="risk"),
-        asyncio.create_task(_guarded(execution.run(), "execution"), name="execution"),
-        asyncio.create_task(_guarded(portfolio.run(), "portfolio"), name="portfolio"),
-        asyncio.create_task(_watchdog(scanner, config), name="watchdog"),
+        asyncio.create_task(_guarded(feed.run(), "crypto_feed"), name="crypto_feed"),
     ]
-
-    tasks.append(
-        asyncio.create_task(
-            _guarded(
-                _bankroll_refresher(
-                    risk=risk,
-                    scanner=scanner,
-                    api_key=env.api_key,
-                    private_key_path=env.private_key_path,
-                    base_url=env.rest_base_url,
-                ),
-                "bankroll_refresher",
-            ),
-            name="bankroll_refresher",
-        )
-    )
+    if config.persist_jsonl:
+        writer = L2JsonlWriter(snapshot_queue=snapshot_queue, output_dir=config.jsonl_output_dir)
+        tasks.append(asyncio.create_task(_guarded(writer.run(), "l2_jsonl_writer"), name="l2_jsonl_writer"))
+    else:
+        tasks.append(asyncio.create_task(_guarded(_drain_snapshots(snapshot_queue), "snapshot_drain"), name="snapshot_drain"))
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: [t.cancel() for t in tasks])
+        loop.add_signal_handler(sig, lambda: [task.cancel() for task in tasks])
 
-    logger.info("All agents running (%d tasks). Press Ctrl+C to stop.", len(tasks))
+    logger.info(
+        "Microstructure L2 ingestion running | symbols=%s | depth=%d | jsonl=%s",
+        ",".join(config.symbols),
+        config.book_depth,
+        config.jsonl_output_dir if config.persist_jsonl else "disabled",
+    )
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
-        logger.info("Shutdown signal received — stopping agents.")
+        logger.info("Shutdown signal received; stopping ingestion.")
         try:
             await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
                 timeout=_SHUTDOWN_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
-            still_running = [t.get_name() for t in tasks if not t.done()]
-            logger.warning("Shutdown timed out after %.0fs — tasks still running: %s", _SHUTDOWN_TIMEOUT_SECONDS, still_running)
+        except TimeoutError:
+            still_running = [task.get_name() for task in tasks if not task.done()]
+            logger.warning("Shutdown timed out; tasks still running: %s", still_running)
     finally:
         _PID_PATH.unlink(missing_ok=True)
-        logger.info("[kinzie] Daemon stopped")
+        logger.info("[microstructure] L2 ingestion stopped")
 
 
 if __name__ == "__main__":

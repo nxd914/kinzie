@@ -1,110 +1,88 @@
-"""
-Crypto strategy data models.
-KalshiMarket is shared — imported from core.models.
-All types are immutable dataclasses.
-"""
+"""Core research data structures for normalized L2 order-book snapshots."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Optional
-
-from core.models import KalshiMarket  # noqa: F401  (re-exported for local imports)
-
-
-class Side(str, Enum):
-    YES = "YES"
-    NO = "NO"
-
-
-class OrderStatus(str, Enum):
-    PENDING = "PENDING"
-    FILLED = "FILLED"
-    REJECTED = "REJECTED"
-    CANCELLED = "CANCELLED"
-
-
-class SignalType(str, Enum):
-    MOMENTUM_UP = "MOMENTUM_UP"
-    MOMENTUM_DOWN = "MOMENTUM_DOWN"
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 
 @dataclass(frozen=True)
-class Tick:
-    """Normalized price tick from a CEX (Binance or Coinbase)."""
-    exchange: str          # "binance" | "coinbase"
-    symbol: str            # e.g. "BTCUSDT"
+class BookLevel:
+    """One price level in a limit order book."""
+
     price: float
-    timestamp: datetime
-    volume: float = 0.0
-    obi: float = 0.0       # Order Book Imbalance: (bid_vol - ask_vol) / (bid_vol + ask_vol)
+    volume: float
+
+    def to_dict(self) -> dict[str, float]:
+        return {"price": self.price, "volume": self.volume}
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any] | list[Any] | tuple[Any, ...]) -> BookLevel:
+        if isinstance(raw, dict):
+            return cls(price=float(raw["price"]), volume=float(raw["volume"]))
+        return cls(price=float(raw[0]), volume=float(raw[1]))
 
 
 @dataclass(frozen=True)
-class FeatureVector:
-    """
-    Spot-derived features computed by the feature agent.
-    Separating feature computation from decision logic keeps the decision
-    rule mathematically defensible and avoids overfitting.
-    """
+class L2Snapshot:
+    """Normalized top-N L2 order-book snapshot."""
+
+    exchange: str
     symbol: str
     timestamp: datetime
-    spot_price: float         # current CEX spot price at feature computation time
-    short_return: float       # return over last N seconds
-    realized_vol: float       # rolling annualized vol (60s window, for signal detection)
-    jump_detected: bool       # True if return exceeds jump threshold
-    momentum_z: float         # z-score of short return vs rolling mean
-    realized_vol_long: float = 0.0  # rolling annualized vol (15min window, for pricing). Falls back to realized_vol if 0.
-    realized_vol_1h: float = 0.0    # rolling annualized vol (1h window, for 4h-8h contracts).
-    ewma_drift_short: float = 0.0   # annualized EWMA log-return drift (30s half-life). Used for ≤15min horizons.
-    ewma_drift_long: float = 0.0    # annualized EWMA log-return drift (5min half-life). Used for ≥1h horizons.
-    ewma_obi: float = 0.0           # short-term EWMA of order book imbalance
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    sequence: int
 
+    @property
+    def best_bid(self) -> BookLevel | None:
+        return self.bids[0] if self.bids else None
 
-@dataclass(frozen=True)
-class Signal:
-    """
-    Deterministic output of the decision rule: features → implied prob shift.
-    No learned model — pure math so the edge is defensible.
-    """
-    signal_type: SignalType
-    symbol: str
-    timestamp: datetime
-    features: FeatureVector
-    implied_prob_shift: float   # estimated direction of market prob move
-    confidence: float           # in [0, 1], derived from feature strength
-    # Optional: both clubs + actor (e.g. scorer) for Kalshi title matching
-    match_teams: tuple[str, ...] = field(default_factory=tuple)
+    @property
+    def best_ask(self) -> BookLevel | None:
+        return self.asks[0] if self.asks else None
 
+    @property
+    def spread(self) -> float:
+        if self.best_bid is None or self.best_ask is None:
+            return float("nan")
+        return self.best_ask.price - self.best_bid.price
 
-@dataclass(frozen=True)
-class TradeOpportunity:
-    """
-    A scored market opportunity where model probability diverges from
-    Kalshi's implied probability enough to justify a position.
-    """
-    signal: Signal
-    market: KalshiMarket
-    side: Side
-    model_prob: float        # our estimated probability
-    market_prob: float       # Kalshi's current implied probability (market mid)
-    edge: float              # |model_prob - market_prob|
-    kelly_fraction: float    # unconstrained Kelly bet fraction
-    capped_fraction: float   # Kelly capped at MAX_KELLY_FRACTION
+    @property
+    def mid(self) -> float:
+        if self.best_bid is None or self.best_ask is None:
+            return float("nan")
+        return (self.best_bid.price + self.best_ask.price) / 2.0
 
+    @property
+    def volume_weighted_mid(self) -> float:
+        levels = self.bids + self.asks
+        total_volume = sum(level.volume for level in levels)
+        if total_volume <= 0:
+            return self.mid
+        return sum(level.price * level.volume for level in levels) / total_volume
 
-@dataclass(frozen=True)
-class Order:
-    """A paper or live order placed on Kalshi."""
-    opportunity: TradeOpportunity
-    size_usdc: float
-    status: OrderStatus
-    fill_price: Optional[float]
-    placed_at: datetime
-    filled_at: Optional[datetime] = None
-    order_id: Optional[str] = None
-    error: Optional[str] = None
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.astimezone(UTC).isoformat(),
+            "bids": [level.to_dict() for level in self.bids],
+            "asks": [level.to_dict() for level in self.asks],
+            "sequence": self.sequence,
+        }
 
-
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> L2Snapshot:
+        timestamp = raw["timestamp"]
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        return cls(
+            exchange=str(raw["exchange"]),
+            symbol=str(raw["symbol"]),
+            timestamp=timestamp,
+            bids=tuple(BookLevel.from_raw(level) for level in raw["bids"]),
+            asks=tuple(BookLevel.from_raw(level) for level in raw["asks"]),
+            sequence=int(raw.get("sequence", 0)),
+        )

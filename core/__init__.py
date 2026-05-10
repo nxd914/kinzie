@@ -1,5 +1,5 @@
-from .kelly import compute_kelly, capped_kelly, position_size
+"""Shared utilities for microstructure research pipelines."""
 
-__all__ = [
-    "compute_kelly", "capped_kelly", "position_size",
-]
+from .db import connect
+
+__all__ = ["connect"]

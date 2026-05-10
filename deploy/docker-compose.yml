@@ -1,17 +1,19 @@
 services:
   daemon:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
     command: python3 -m strategies.crypto.daemon
     restart: always
-    env_file: .env
     volumes:
-      - kinzie-data:/app/data
-      - ${KALSHI_PRIVATE_KEY_PATH:-/dev/null}:/app/kalshi_private.pem:ro
+      - microstructure-data:/app/data
     environment:
-      - KALSHI_PRIVATE_KEY_PATH=/app/kalshi_private.pem
+      - KRAKEN_SYMBOLS=${KRAKEN_SYMBOLS:-BTC,ETH}
+      - KRAKEN_BOOK_DEPTH=${KRAKEN_BOOK_DEPTH:-10}
+      - SNAPSHOT_QUEUE_SIZE=${SNAPSHOT_QUEUE_SIZE:-5000}
+      - L2_PERSIST_JSONL=${L2_PERSIST_JSONL:-true}
+      - L2_JSONL_OUTPUT_DIR=/app/data/l2
 
 volumes:
-  kinzie-data:
+  microstructure-data:
     driver: local

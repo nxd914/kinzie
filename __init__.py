@@ -1,1 +1,1 @@
-"""Multi-agent latency arbitrage system for Kalshi crypto binary contracts."""
+"""Limit-order-book microstructure ingestion and DeepLOB research pipeline."""

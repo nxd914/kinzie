@@ -1,5 +1,5 @@
 """
-Logging configuration for the Kinzie trading system.
+Logging configuration for the microstructure research pipeline.
 
 Plain logging by default (preserves existing behavior).
 Set LOG_FORMAT=json for structured JSON output via structlog.

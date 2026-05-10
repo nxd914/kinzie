@@ -1,61 +1,61 @@
 # PRIME DIRECTIVE
-You are an Autonomous Trading Operator. Ship profitable trades on Kalshi crypto binaries.
-**Every session must end with a deployed code change that increases fill rate or edge, OR a hotfix to something broken.**
-Do not refactor. Do not theorize. Do not wait for data. Fix it now and ship it.
-**`EXECUTION_MODE=paper` — uses Kalshi demo API keys and balance. Do not change.**
 
-## SYSTEM STATUS & MECHANICS (Deployed 2026-05-07)
-**Live & Defensive.** Cash $821.47 (demo).
-- **Price Caps**: NO capped at 70¢, YES capped at 40¢. Bracket NO capped at 70¢, YES capped at 30¢.
-- **Edge calc**: Computed vs ask (actual cost to enter), not mid.
-- **Dynamic Slippage**: Breakeven gate uses `max(estimated_slippage, spread_pct × price / 2)`.
-- **Drift & Disagreement**: `|p_drift − p_zero| < 0.005` rejects. Sign must match side. *Only applies to signal scans.*
-- **Feeds**: Kraken WS exclusively (Binance/Coinbase block GCP IPs silently).
+This repository is a quantitative research environment for limit-order-book microstructure modeling. It is not an order-routing, discretionary strategy, or execution platform. Every change must preserve reproducibility, temporal correctness, and clean separation between ingestion, data construction, and model training.
 
-## DIAGNOSTICS (Check these first)
-`$GCE 'sudo docker exec kinzie-daemon-1 python3 -m research.live_roi'`
-`$GCE 'sudo docker logs kinzie-daemon-1 --tail=500 2>&1 | grep -E "Order outcome|RISK REJECT|SCAN_CYCLE|SIGNAL_SCAN"'`
-- **Zero Fills?** Read the skip histogram from logs. Dominant skip dictates action:
-  - `too_far_out` → raise `max_hours_to_close`
-  - `bracket_no_too_expensive` / `no_too_expensive` / `yes_too_expensive` → **DO NOT loosen.**
-  - `atm_bracket` → lower `min_bracket_distance_pct`
-  - `low_edge` → lower `min_edge`
-  - `kelly_zero` → model prob too close to market price for Kelly to size
+## Research Integrity
 
-## PROFIT LEVERS (strategies/crypto/core/config.py)
-**All tuning knobs are in Config.** Do NOT add module-level constants.
+- Look-ahead bias is prohibited. Features, labels, validation windows, and diagnostics must never use information unavailable at the prediction timestamp.
+- Data normalization must be backward-looking only. Use rolling statistics computed strictly from observations at or before time `t`; never fit scalers on the full dataset before splitting.
+- Preserve event ordering by symbol, timestamp, and sequence. Any resampling, imputation, or filtering must be explicit and auditable.
+- Missing ticks, partial books, crossed books, and outliers must be handled deterministically. Do not silently discard data unless the rule is documented and covered by tests.
 
-| Knob | Current | Push to fill more | Push for better edge |
-|---|---|---|---|
-| `min_edge` | **0.020** | Lower to 0.015 | Raise to 0.03 |
-| `min_return_on_risk` | **0.12** | Lower to 0.08 | Raise to 0.15 |
-| `max_hours_to_close` | **12** | Raise to 24 | Lower to 6 |
-| `max_concurrent_positions` | **5** | Raise to 8 | Keep at 5 |
-| `execution_fill_grace_seconds` | **30** | Raise to 45 | Lower to 15 |
-| `execution_cross_offset_max` | **0.08** | Raise to 0.12 | Lower to 0.05 |
-| `bracket_calibration` | **0.62** | Raise to 0.70 | Lower to 0.50 |
-| `max_drift_annualized` | **5.0** | Raise to 8.0 | Lower to 3.0 |
-| `min_disagreement` | **0.005**| Lower to 0.003 | Raise to 0.008 |
-*(Omitted caps/cooldowns: tune only if structurally necessary)*
+## Validation Standards
 
-## RISK GATES (Scanner & RiskAgent)
-1. **Disagreement / Drift Sign**: Reject if signal lacks momentum or opposes side.
-2. **Price Caps**: Reject YES > 40¢, NO > 70¢. Bracket NO > 70¢, Bracket YES > 30¢. NO Floor < 40¢.
-3. **Return on risk**: `edge / market_price < 0.12` → reject.
-4. **Dynamic breakeven**: `edge < fee(P) + max(0.005, spread×price/2)` → reject.
-5. **15M Contract Cap**: Max 20 contracts per KXBTC15M/KXETH15M position.
+- Time-series experiments must use Purged K-Fold or Walk-Forward cross-validation.
+- Random train/test splits are forbidden for LOB experiments.
+- Validation gaps must purge samples whose feature windows or target horizons overlap evaluation periods.
+- Report metrics by time window and symbol where possible so instability is visible.
 
-## INVARIANTS
-- **Poll-then-cancel**: poll `get_order` every 1s for grace period. Cancel only if unfilled at deadline.
-- **PortfolioAgent is truth**: seeds from `get_balance` + `get_positions`. Reconciles every 60s.
-- **Config is single source of truth**: scanner reads `self._cfg`, NEVER module constants.
+## Infrastructure Rules
 
-## DEPLOY
-```bash
-GCE="gcloud compute ssh kinzie-daemon --zone=us-central1-a --project=project-41e99557-708c-4594-ba5 --"
-SCP() { gcloud compute scp "$1" "kinzie-daemon:/opt/kinzie/${1#/Users/noahdonovan/kinzie/}" \
-  --zone=us-central1-a --project=project-41e99557-708c-4594-ba5; }
-SCP /Users/noahdonovan/kinzie/path/to/changed_file.py
-$GCE 'sudo systemctl restart kinzie'
+- Data ingestion must remain containerized. Production collection runs through Docker and the daemon entry point, not ad hoc scripts.
+- The PyTorch Lightning `LOBDataModule` is the single source of truth for tensor creation.
+- Model code must consume tensors produced by the DataModule rather than rebuilding feature windows independently.
+- Raw snapshots should remain replayable append-only records. Derived datasets can be regenerated from the JSONL source.
+
+## Target Definition
+
+The prediction target is the volume-weighted mid-price return over the next `k` ticks:
+
+```text
+target[t, k] = volume_weighted_mid[t + k] / volume_weighted_mid[t] - 1
 ```
-PEM pitfall: GCE `.env` must use `/app/kalshi_private.pem`. Never `scp` local `.env`.
+
+The horizon `k` is measured in observed snapshots for the same symbol, not wall-clock seconds.
+
+## Interfaces
+
+- `CryptoFeedAgent(snapshot_queue, symbols, depth=10)` emits normalized `L2Snapshot` records from Kraken L2 books.
+- `L2JsonlWriter(snapshot_queue, output_dir)` appends one JSON object per snapshot.
+- `LOBDataModule(data_paths, window_size=100, horizon=10, batch_size=64)` owns snapshot loading, feature windowing, target alignment, and dataloader creation.
+- `DeepLOBCNNLSTM(num_features=40, hidden_size=64, num_lstm_layers=2, dropout=0.1)` returns one scalar future-return prediction per sample.
+
+## Environment
+
+```bash
+KRAKEN_SYMBOLS=BTC,ETH
+KRAKEN_BOOK_DEPTH=10
+SNAPSHOT_QUEUE_SIZE=5000
+L2_PERSIST_JSONL=true
+L2_JSONL_OUTPUT_DIR=data/l2
+LOB_WINDOW_SIZE=100
+LOB_TARGET_HORIZON=10
+LOB_BATCH_SIZE=64
+```
+
+## Required Checks
+
+```bash
+pytest
+rg -n -i "look-ahead|random split|full-dataset scaler" strategies tests
+```

@@ -1,54 +1,74 @@
-[![CI](https://img.shields.io/github/actions/workflow/status/nxd914/kinzie/ci.yml?branch=main&label=CI)](https://github.com/nxd914/kinzie/actions)
-[![License](https://img.shields.io/github/license/nxd914/kinzie)](https://github.com/nxd914/kinzie/blob/main/LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org)
-[![GitHub last commit](https://img.shields.io/github/last-commit/nxd914/kinzie)](https://github.com/nxd914/kinzie/commits/main)
+# Microstructure
 
-# Kinzie
+Microstructure is an institutional-grade Limit Order Book (LOB) research pipeline for high-frequency price dynamics. The system ingests asynchronous Level 2 order-book updates, converts them into reproducible training records, and provides a DeepLOB-style CNN-LSTM architecture for modeling short-horizon volume-weighted mid-price returns from 10-level bid/ask structure.
 
-Async prediction market trading daemon for Kalshi crypto markets. Deterministic execution pipeline — no ML, no heuristics. Every decision is a closed-form function of market price and realized volatility (Black-Scholes N(d2)), sized by fee-adjusted quarter-Kelly, gated behind hard risk controls.
+## Production Infrastructure
 
-## Pipeline
+The ingestion daemon subscribes to Kraken L2 WebSocket `book` streams and maintains local 10-level bid and ask books per symbol. Each normalized `L2Snapshot` is written as append-only JSONL so training jobs can consume deterministic, replayable records without depending on a running exchange connection.
 
-```
-CryptoFeedAgent ──► FeatureAgent ──► ScannerAgent ──► RiskAgent ──► ExecutionAgent ──► ResolutionAgent
-                                           ▲
-                                     WebsocketAgent
-                                    (real-time price cache)
+```text
+Kraken L2 WebSocket -> CryptoFeedAgent -> L2Snapshot queue -> L2JsonlWriter
+                                                            |
+                                                            +-> LOBDataModule
+                                                            +-> DeepLOB CNN-LSTM
 ```
 
-Seven async agents coordinated through `asyncio.Queue` instances. No shared mutable state between agents.
+The containerized daemon is designed for long-running collection. Docker owns the runtime environment, `.env` controls symbols and persistence settings, and mounted volumes retain distributed snapshot shards under `data/l2`.
 
-## Stack
+## Rigorous Research Methodology
 
-- **Runtime**: Python 3.11+, `asyncio`, frozen dataclasses throughout
-- **Persistence**: SQLite (WAL mode) — every fill records market state at signal time
-- **Testing**: pytest + [Hypothesis](https://hypothesis.readthedocs.io/) property-based tests
-- **Quality**: ruff (lint + format), mypy (strict), GitHub Actions on every push and PR across Python 3.11/3.12
-- **Deployment**: Docker + GCE (e2-small, us-central1-a); structured JSON logging via `LOG_FORMAT=json`
+Market microstructure data is noisy, asynchronous, and frequently incomplete. The pipeline handles this by sorting snapshots by symbol, timestamp, and sequence; padding missing book levels with neutral values; transforming price levels relative to the current volume-weighted mid; and preserving raw event order for offline audits. Tensor creation flows through the PyTorch Lightning `LOBDataModule`, which builds rolling LOB windows and the prediction target:
 
-## Repository
-
-```
-strategies/crypto/          Daemon entry point and all trading agents
-  daemon.py                 Entry point: python3 -m strategies.crypto.daemon
-  agents/                   Seven async agents
-  core/                     Config, features, logging, models, pricing
-
-core/                       Shared utilities (db, kelly, kalshi_client, alert, environment)
-research/                   Monitoring scripts: live_roi, pnl_dashboard, health_check, edge_analysis
-scripts/                    Operational one-offs (sync_demo_fills, force_resolve, run.sh)
-deploy/                     Dockerfile, docker-compose.yml, kinzie.service, gce_setup.sh
-tests/                      Pytest suite + Hypothesis property tests
+```text
+volume_weighted_mid[t + k] / volume_weighted_mid[t] - 1
 ```
 
-## Quick start
+Research code must avoid look-ahead bias. Normalization for experiments should use backward-looking rolling windows only, and validation should use Purged K-Fold or Walk-Forward splits rather than random train/test splits.
+
+## Quick Start
+
+Clone the repository:
+
+```bash
+git clone https://github.com/nxd914/microstructure.git
+cd microstructure
+```
+
+Start the ingestion daemon with Docker:
+
+```bash
+cp .env.example .env 2>/dev/null || true
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+Default ingestion settings:
+
+```bash
+KRAKEN_SYMBOLS=BTC,ETH
+KRAKEN_BOOK_DEPTH=10
+SNAPSHOT_QUEUE_SIZE=5000
+L2_PERSIST_JSONL=true
+L2_JSONL_OUTPUT_DIR=data/l2
+```
+
+Run the local research and regression suite:
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -q --tb=short
+pytest
 ```
 
-Requires credentials in a `.env` at the repo root. See `CLAUDE.md` for all environment variables and the full ops runbook.
+## Repository Layout
+
+```text
+strategies/crypto/daemon.py          Ingestion daemon entry point
+strategies/crypto/agents/            Kraken L2 feed agent
+strategies/crypto/core/              Config, L2 models, JSONL writer, logging
+strategies/crypto/research/          DataModule, targets, DeepLOB model scaffold
+core/                                Shared runtime utilities
+deploy/                              Container and service files
+tests/                               Feed, storage, target, data, model tests
+```
 
 ## License
 
