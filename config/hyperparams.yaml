@@ -1,0 +1,11 @@
+# Model Hyperparameters
+model:
+  num_features: 40
+  hidden_size: 64
+  num_lstm_layers: 2
+  dropout: 0.1
+
+data:
+  window_size: 100
+  horizon: 10
+  batch_size: 64
